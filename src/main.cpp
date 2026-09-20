@@ -1,5 +1,8 @@
 #include "cpu_pricer.h"
 #include "black_scholes.h"
+#ifdef RISK_ENGINE_HAS_CUDA
+#include "gpu_pricer.h"
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -32,6 +35,24 @@ int main() {
                   << "Absolute error: " << std::abs(result.price - analyticalPrice) << '\n'
                   << std::setprecision(3)
                   << "Pricing time (ms): " << elapsed.count() << '\n';
+
+#ifdef RISK_ENGINE_HAS_CUDA
+        const auto gpuStart = std::chrono::steady_clock::now();
+        const auto gpuResult = priceEuropeanCallGPU(params, numSimulations, seed);
+        const auto gpuEnd = std::chrono::steady_clock::now();
+        const std::chrono::duration<double, std::milli> gpuElapsed = gpuEnd - gpuStart;
+        const double gpuMargin = 1.96 * gpuResult.standardError;
+        std::cout << "\nGPU Monte Carlo European call (CPU aggregation)\n"
+                  << std::fixed << std::setprecision(6)
+                  << "Estimated price: " << gpuResult.price << '\n'
+                  << "Standard error: " << gpuResult.standardError << '\n'
+                  << "Approximate 95% confidence interval: ["
+                  << gpuResult.price - gpuMargin << ", " << gpuResult.price + gpuMargin << "]\n"
+                  << "Black-Scholes price: " << analyticalPrice << '\n'
+                  << "Absolute error: " << std::abs(gpuResult.price - analyticalPrice) << '\n'
+                  << std::setprecision(3)
+                  << "End-to-end time (ms, includes CUDA startup): " << gpuElapsed.count() << '\n';
+#endif
     } catch (const std::exception& error) {
         std::cerr << "Pricing failed: " << error.what() << '\n';
         return 1;

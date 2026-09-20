@@ -25,6 +25,7 @@ replay_pid*
 
 # C++ / CMake build outputs
 build/
+build-*/
 cmake-build-*/
 *.o
 *.obj

@@ -4,8 +4,9 @@ GPU-accelerated Monte Carlo option pricing and risk engine built with C++ and CU
 ## Status
 
 CPU Monte Carlo baseline implemented with a timed example run and Black–Scholes
-price comparison for a European call on a non-dividend-paying stock. CUDA kernels
-and benchmarks will be added step by step.
+price comparison for a European call on a non-dividend-paying stock. An optional
+CUDA baseline generates discounted payoffs on the GPU and aggregates them on the
+CPU. GPU compilation and execution need verification on an NVIDIA machine.
 
 ## Structure
 
@@ -14,13 +15,16 @@ cuda-monte-carlo-risk-engine/
 ├── CMakeLists.txt
 ├── README.md
 ├── include/
-│   └── option_params.h
+│   ├── option_params.h
+│   └── monte_carlo_result.h
 ├── src/
 │   ├── main.cpp
 │   ├── black_scholes.cpp
 │   ├── black_scholes.h
 │   ├── cpu_pricer.cpp
-│   └── cpu_pricer.h
+│   ├── cpu_pricer.h
+│   ├── gpu_pricer.h
+│   └── gpu_pricer.cu
 ├── benchmarks/
 └── scripts/
 ```
@@ -64,3 +68,31 @@ estimation is included in pricing time. Monte Carlo sampling error is expected; 
 price comparison does not establish statistical convergence.
 
 The GPU milestones will additionally require an NVIDIA GPU and CUDA toolkit.
+
+## CUDA baseline on Colab (T4)
+
+After pushing local changes to GitHub, run these commands in the Colab notebook:
+
+```python
+%cd /content/cuda-monte-carlo-risk-engine
+!git pull --ff-only
+!cmake -S . -B build-gpu -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+!cmake --build build-gpu -j2
+!./build-gpu/risk_engine
+```
+
+The architecture setting above targets the T4. CUDA is disabled by default so
+the CPU build can still run on a Mac without a CUDA toolkit.
+
+Each GPU thread initializes a cuRAND Philox subsequence using its path index,
+generates one normal sample, and writes one discounted payoff. Threads beyond
+the requested simulation count return without accessing the payoff array.
+After copying the array to the CPU, Welford's algorithm estimates the mean and
+standard error. CPU and GPU generators differ, so matching seeds do not imply
+matching prices. Compare each estimate with Black–Scholes using its uncertainty;
+an approximate 95% interval can miss the analytical value by chance.
+
+GPU timing includes CUDA startup, allocations, random generation, the kernel,
+device-to-host transfer, CPU aggregation, and cleanup. This initial single-run
+timing is not a warmed-up speedup benchmark. GPU reduction and repeated timing
+are later milestones.

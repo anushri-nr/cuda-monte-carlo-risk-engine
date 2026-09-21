@@ -5,8 +5,8 @@ GPU-accelerated Monte Carlo option pricing and risk engine built with C++ and CU
 
 CPU Monte Carlo baseline implemented with a timed example run and Black–Scholes
 price comparison for a European call on a non-dividend-paying stock. An optional
-CUDA baseline generates discounted payoffs on the GPU and aggregates them on the
-CPU. GPU compilation and execution need verification on an NVIDIA machine.
+CUDA baseline generates discounted payoffs on the GPU and reduces them into block statistics before a final CPU merge. The initial CUDA
+baseline was run on Colab T4; the new reduction needs verification there.
 
 ## Structure
 
@@ -71,7 +71,6 @@ The GPU milestones will additionally require an NVIDIA GPU and CUDA toolkit.
 
 ## CUDA baseline on Colab (T4)
 
-After pushing local changes to GitHub, run these commands in the Colab notebook:
 
 ```python
 %cd /content/cuda-monte-carlo-risk-engine
@@ -87,8 +86,10 @@ the CPU build can still run on a Mac without a CUDA toolkit.
 Each GPU thread initializes a cuRAND Philox subsequence using its path index,
 generates one normal sample, and writes one discounted payoff. Threads beyond
 the requested simulation count return without accessing the payoff array.
-After copying the array to the CPU, Welford's algorithm estimates the mean and
-standard error. CPU and GPU generators differ, so matching seeds do not imply
+A second kernel uses shared memory to merge counts, means, and squared
+deviations within each 256-thread block. Inactive lanes contribute empty
+statistics and still participate in all barriers. Only block summaries are
+copied to the CPU, which merges them to estimate price and standard error. CPU and GPU generators differ, so matching seeds do not imply
 matching prices. Compare each estimate with Black–Scholes using its uncertainty;
 an approximate 95% interval can miss the analytical value by chance.
 
@@ -96,11 +97,27 @@ The program runs one full GPU warm-up call before the measured call, using the
 same seed. Warm-up samples are discarded. The measured call reports:
 
 - Kernel time using CUDA events, including cuRAND initialization and sampling.
+- GPU block reduction time using CUDA events.
 - Blocking device-to-host copy time using a CPU wall clock (including any host staging).
-- CPU aggregation time using a CPU wall clock.
+- CPU summary merge time using a CPU wall clock.
 - Warmed end-to-end wall time, including allocations, all stages, timing
   instrumentation, and cleanup, but excluding the warm-up and console output.
 
 The stage times do not sum to total time because setup and cleanup are additional
 costs. Each program invocation warms up its own CUDA context. This is still one
-measured run; repeated benchmarks and GPU reduction are later milestones.
+measured run; repeated benchmarks and further reduction optimizations are later milestones.
+
+
+For one million paths, 3,907 summaries of 24 bytes replace the 8,000,000-byte
+payoff transfer (93,768 bytes). Payoffs are still stored on the GPU in this
+version; fusing simulation and reduction is a possible later optimization.
+
+Run the reduction checks on Colab after building:
+
+```python
+!nvcc -std=c++17 -O2 -arch=sm_75 -Iinclude tests/gpu_reduction_test.cu -o build-gpu/gpu_reduction_test
+!./build-gpu/gpu_reduction_test
+```
+
+These compare GPU summaries against a two-pass long-double CPU reference for
+small and partially filled blocks, constant payoffs, and large-offset data.

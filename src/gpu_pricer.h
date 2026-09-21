@@ -5,11 +5,12 @@
 
 struct GpuTimings {
     double kernelMs;
+    double reductionMs;
     double transferMs;
     double aggregationMs;
 };
 
-// One payoff per GPU thread, followed by CPU aggregation. Requires N >= 2.
+// One payoff per GPU thread, GPU block reduction and CPU summary merging. Requires N >= 2.
 MonteCarloResult priceEuropeanCallGPU(
     const OptionParams& params,
     long long numSimulations,

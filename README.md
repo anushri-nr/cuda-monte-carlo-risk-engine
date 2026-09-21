@@ -1,76 +1,34 @@
-# cuda-monte-carlo-risk-engine
-GPU-accelerated Monte Carlo option pricing and risk engine built with C++ and CUDA, featuring cuRAND simulation, parallel reductions, profiling, and CPU/GPU benchmarking.
+# CUDA Monte Carlo Risk Engine
 
-## Status
+C++17 and CUDA European call pricing for a non-dividend-paying stock, with a
+serial CPU baseline, Black–Scholes validation, and repeated CPU/GPU benchmarks.
 
-CPU Monte Carlo baseline implemented with a timed example run and Black–Scholes
-price comparison for a European call on a non-dividend-paying stock. An optional
-CUDA baseline generates discounted payoffs on the GPU and reduces them into block statistics before a final CPU merge. The initial CUDA
-baseline was run on Colab T4; the new reduction needs verification there.
+## Implementation
 
-## Structure
+The CPU simulates discounted payoffs and estimates price and standard error
+using Welford's algorithm. The GPU uses one fused simulation-and-reduction
+kernel: each thread draws a normal sample from its own cuRAND Philox subsequence
+and contributes a payoff to a shared-memory reduction. Each 256-thread block
+writes a count, mean, and sum of squared deviations. The CPU merges these block
+summaries. Inactive threads contribute empty summaries and reach every barrier.
 
-```text
-cuda-monte-carlo-risk-engine/
-├── CMakeLists.txt
-├── README.md
-├── include/
-│   ├── option_params.h
-│   └── monte_carlo_result.h
-├── src/
-│   ├── main.cpp
-│   ├── black_scholes.cpp
-│   ├── black_scholes.h
-│   ├── cpu_pricer.cpp
-│   ├── cpu_pricer.h
-│   ├── gpu_pricer.h
-│   └── gpu_pricer.cu
-├── benchmarks/
-└── scripts/
-```
+Only block summaries are allocated in GPU global memory; no intermediate payoff
+array is needed. At 10 million paths this avoids an 80 MB payoff buffer.
+CPU and GPU generators differ, so matching seeds do not imply matching prices.
+The approximate 95% confidence interval is price ± 1.96 × standard error;
+a single interval can miss the analytical price by chance.
 
-`include/` holds shared inputs, `src/` holds pricing and application code,
-`benchmarks/` will hold measurements, and `scripts/` will hold automation and plotting tools.
+## Build and run
 
-## Roadmap
-
-1. CPU Monte Carlo baseline for a European call option
-2. Black–Scholes validation
-3. CUDA simulation kernel
-4. cuRAND integration
-5. GPU parallel reduction
-6. Shared-memory and warp-level optimization
-7. Nsight profiling
-8. CPU vs GPU benchmarking
-9. Optional Greeks / VaR extensions
-
-## Build setup
-
-The CPU baseline uses C++17 and CMake 3.18 or newer.
+CPU only (CMake 3.18+ and a C++17 compiler):
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake --build build -j2
 ./build/risk_engine
 ```
 
-The example prices a European call using one million simulations and seed 42,
-with spot and strike of 100, a 5% risk-free rate, 20% volatility, and one year
-to expiration. It reports the estimated price, Black–Scholes price, absolute error,
-and elapsed pricing time, including
-random number generation but excluding console output. A single timing is a
-smoke check; repeated benchmarks will be added later. The analytical comparison
-is outside the timed region. The CPU result includes standard error estimated
-from sample payoff variance using Welford's algorithm and requires at least two
-simulations. The displayed approximate 95% confidence interval is price ± 1.96
-times standard error, using a large-sample normal approximation. Variance
-estimation is included in pricing time. Monte Carlo sampling error is expected; a single
-price comparison does not establish statistical convergence.
-
-The GPU milestones will additionally require an NVIDIA GPU and CUDA toolkit.
-
-## CUDA baseline on Colab (T4)
-
+CUDA on a Colab T4 (NVIDIA GPU and CUDA toolkit required):
 
 ```python
 %cd /content/cuda-monte-carlo-risk-engine
@@ -80,73 +38,53 @@ The GPU milestones will additionally require an NVIDIA GPU and CUDA toolkit.
 !./build-gpu/risk_engine
 ```
 
-The architecture setting above targets the T4. CUDA is disabled by default so
-the CPU build can still run on a Mac without a CUDA toolkit.
+The example uses one million paths, seed 42, spot and strike 100, a 5% risk-free
+rate, 20% volatility, and one year to expiration. Both pricers require at least
+two paths to estimate sample variance.
 
-Each GPU thread initializes a cuRAND Philox subsequence using its path index,
-generates one normal sample, and writes one discounted payoff. Threads beyond
-the requested simulation count return without accessing the payoff array.
-A second kernel uses shared memory to merge counts, means, and squared
-deviations within each 256-thread block. Inactive lanes contribute empty
-statistics and still participate in all barriers. Only block summaries are
-copied to the CPU, which merges them to estimate price and standard error. CPU and GPU generators differ, so matching seeds do not imply
-matching prices. Compare each estimate with Black–Scholes using its uncertainty;
-an approximate 95% interval can miss the analytical value by chance.
+GPU output reports fused kernel time with CUDA events, blocking return-copy time
+and CPU summary merge time with a wall clock, and total wall time. The full GPU
+call is warmed up once before measurement. Total time includes allocations,
+synchronization, timing instrumentation, transfers, merging, and cleanup.
+Warm-up and console output are excluded. Stage times omit setup and cleanup,
+so they do not sum to total time.
 
-The program runs one full GPU warm-up call before the measured call, using the
-same seed. Warm-up samples are discarded. The measured call reports:
+## Tests
 
-- Kernel time using CUDA events, including cuRAND initialization and sampling.
-- GPU block reduction time using CUDA events.
-- Blocking device-to-host copy time using a CPU wall clock (including any host staging).
-- CPU summary merge time using a CPU wall clock.
-- Warmed end-to-end wall time, including allocations, all stages, timing
-  instrumentation, and cleanup, but excluding the warm-up and console output.
-
-The stage times do not sum to total time because setup and cleanup are additional
-costs. Each program invocation warms up its own CUDA context. This is still one
-measured run; repeated benchmarks and further reduction optimizations are later milestones.
-
-
-For one million paths, 3,907 summaries of 24 bytes replace the 8,000,000-byte
-payoff transfer (93,768 bytes). Payoffs are still stored on the GPU in this
-version; fusing simulation and reduction is a possible later optimization.
-
-Run the reduction checks on Colab after building:
+Run the standalone fused-kernel checks on Colab:
 
 ```python
 !nvcc -std=c++17 -O2 -arch=sm_75 -Iinclude tests/gpu_reduction_test.cu -o build-gpu/gpu_reduction_test
 !./build-gpu/gpu_reduction_test
 ```
 
-These compare GPU summaries against a two-pass long-double CPU reference for
-small and partially filled blocks, constant payoffs, and large-offset data.
+Checks cover partial-block counts, expiration, zero volatility, repeatability,
+invalid simulation counts, and a loose statistical check against Black–Scholes.
+Local CPU builds cannot validate CUDA execution.
 
+## Benchmarks
 
-## Repeated benchmarks
+`risk_benchmark` measures 10K, 100K, 1M, and 10M paths with one warm-up per
+backend per size, followed by seven measured repetitions. CPU/GPU order
+alternates. Fixed seed 42 measures timing variability, not independent pricing
+trials. CPU and GPU total medians are compared, including allocation and cleanup
+costs. This is not a persistent-buffer or kernel-only speedup benchmark.
 
-`risk_benchmark` measures 10,000, 100,000, 1,000,000, and 10,000,000 paths.
-Each size gets one full warm-up per backend and seven measured runs in the
-same process. CPU/GPU execution order alternates. Seed 42 and the example
-option inputs stay fixed: repeated rows measure timing variability, not
-independent Monte Carlo errors. This is a serial CPU baseline.
-
-CSV rows go to stdout; medians, min/max ranges, and the ratio of CPU median to
-GPU median go to stderr. Total GPU timing includes allocation, synchronization,
-transfers, CPU summary merging, timing instrumentation, and cleanup. Warm-up
-and CSV writes are excluded. This measures repeated full calls, not persistent
-buffer reuse or kernel-only speedup. CPU-only builds also support the benchmark.
-
-On Colab, after pulling and building:
+CSV goes to stdout; median times, min/max ranges, and CPU/GPU speedup go to stderr:
 
 ```python
-!./build-gpu/risk_benchmark > benchmarks/results.csv 2> benchmarks/summary.txt
-!cat benchmarks/summary.txt
+!./build-gpu/risk_benchmark > benchmarks/results_fused_only.csv 2> benchmarks/summary_fused_only.txt
+!cat benchmarks/summary_fused_only.txt
 ```
 
-Check that the benchmark exits successfully before using the CSV; a failed run
-may leave partial data. Each run replaces these output files. Save environment
-information alongside results for reproducibility:
+Rows use `cpu` and `gpu_fused` backend labels. Columns include price, standard
+error, analytical price, absolute error, total time, fused kernel time, transfer
+time, and merge time. The obsolete `reduction_ms` column has been removed.
+CPU rows leave GPU stage columns blank. Older CSV files remain historical data.
+A failed run can leave partial output; check successful completion before using
+results. Running the same command again replaces its output files.
+
+Record environment information alongside results:
 
 ```python
 !git rev-parse HEAD > benchmarks/environment.txt
@@ -157,35 +95,17 @@ information alongside results for reproducibility:
 !cat build-gpu/CMakeCache.txt >> benchmarks/environment.txt
 ```
 
-Download the results, summary, and environment files before the Colab runtime
-expires. GPU timings still require an NVIDIA environment; local CPU checks do
-not validate the CUDA benchmark path.
+Download results and environment information before the Colab runtime expires.
+GPU clocks and shared-cloud conditions can affect timing; report medians and
+ranges rather than selecting the fastest samples.
 
+## Layout and next steps
 
-## Fused simulation and reduction
+- `include/`: shared option inputs and result types.
+- `src/`: CPU pricing, fused GPU pricing, analytical formula, example, benchmarks.
+- `tests/`: standalone CUDA correctness checks.
+- `benchmarks/`: measured data and environment records.
+- `scripts/`: reserved for analysis and plotting helpers.
 
-The default GPU method now generates each payoff and immediately reduces it
-within the block. It allocates only block summaries, eliminating the intermediate
-payoff buffer (80 MB for 10 million paths) and its write/read traffic. Inactive
-threads still reach every synchronization barrier. Philox path subsequences and
-the reduction tree match the separate-kernel version.
-
-The separate-kernel implementation remains available via `GpuMethod::Separate`.
-The benchmark reports `cpu`, `gpu_fused`, and `gpu_separate` rows, with warm-ups
-for all three and alternating forward/reverse execution order. The fused
-`kernel_ms` includes both simulation and reduction; `reduction_ms` is zero
-because there is no separate reduction launch. Compare fused kernel time to the
-sum of the two separate kernel times, and compare total medians for application
-speedup. CSV column layout is unchanged, but GPU backend labels have changed.
-
-The reduction test now also compares fused and separate results for multiple
-seeds, small and partial blocks, expiration, and zero volatility. These changes
-require compilation and execution on Colab before performance or correctness
-claims can be made for the fused path.
-
-Save this comparison separately to preserve earlier results:
-
-```python
-!./build-gpu/risk_benchmark > benchmarks/results_fused.csv 2> benchmarks/summary_fused.txt
-!cat benchmarks/summary_fused.txt
-```
+Next milestones: Nsight profiling, evidence-based kernel optimization, and
+optional Greeks or VaR extensions.

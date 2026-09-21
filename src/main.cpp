@@ -56,7 +56,6 @@ int main() {
                   << "Absolute error: " << std::abs(gpuResult.price - analyticalPrice) << '\n'
                   << std::setprecision(3)
                   << "Fused kernel time (ms, CUDA events): " << gpuTimings.kernelMs << '\n'
-                  << "Separate reduction time (ms, zero when fused): " << gpuTimings.reductionMs << '\n'
                   << "Device-to-host copy time (ms, wall clock): " << gpuTimings.transferMs << '\n'
                   << "CPU summary merge time (ms): " << gpuTimings.aggregationMs << '\n'
                   << "Warmed end-to-end time (ms): " << gpuElapsed.count() << '\n';

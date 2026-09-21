@@ -1,58 +1,61 @@
-// Compile as a standalone CUDA test; including the implementation exposes its
-// internal reduction kernel for testing with known, non-random payoffs.
+// Standalone CUDA checks for the fused kernel and its public pricing interface.
 #include "../src/gpu_pricer.cu"
 #include <algorithm>
 #include <iostream>
 
+void require(bool condition, const char* message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
 int main() {
     try {
-        for (long long n : {2LL, 255LL, 256LL, 257LL, 1025LL}) {
-            for (bool constant : {false, true}) {
-                std::vector<double> values(static_cast<std::size_t>(n));
-                long double sum = 0;
-                for (long long i = 0; i < n; ++i) {
-                    values[i] = constant ? 7.0 : 1e6 + static_cast<double>(i % 17) / 8;
-                    sum += values[i];
-                }
-                const long double mean = sum / n;
-                long double m2 = 0;
-                for (double x : values) m2 += (x - mean) * (x - mean);
-                const auto blocks = (n - 1) / reductionThreads + 1;
-                DevicePayoffs<double> input(values.size() * sizeof(double));
-                DevicePayoffs<Moments> output(blocks * sizeof(Moments));
-                checkCuda(cudaMemcpy(input.data, values.data(), values.size() * sizeof(double),
-                                     cudaMemcpyHostToDevice), "upload test input");
-                reducePayoffs<<<static_cast<unsigned int>(blocks), reductionThreads>>>(input.data, n, output.data);
-                checkCuda(cudaGetLastError(), "test reduction launch");
-                checkCuda(cudaDeviceSynchronize(), "test reduction execution");
-                std::vector<Moments> partials(blocks);
-                checkCuda(cudaMemcpy(partials.data(), output.data, blocks * sizeof(Moments),
-                                     cudaMemcpyDeviceToHost), "download test summaries");
-                Moments total{0, 0, 0};
-                for (const auto& partial : partials) total = mergeMoments(total, partial);
-                if (total.count != n || std::abs(total.mean - mean) > 1e-8L ||
-                    std::abs(total.m2 - m2) > 1e-7L * std::max(1.0L, m2)) {
-                    throw std::runtime_error("Reduction mismatch for N=" + std::to_string(n));
-                }
-            }
-        }
         for (long long n : {2LL, 255LL, 256LL, 257LL, 1025LL, 100000LL}) {
-            for (const OptionParams params : {
-                    OptionParams{100,100,.05,.2,1},
-                    OptionParams{110,100,.05,.2,0},
-                    OptionParams{100,100,.05,0,1}}) {
-                for (unsigned long long seed : {42ULL, 123ULL}) {
-                    const auto separate = priceEuropeanCallGPU(params, n, seed, nullptr, GpuMethod::Separate);
-                    const auto fused = priceEuropeanCallGPU(params, n, seed, nullptr, GpuMethod::Fused);
-                    if (!std::isfinite(fused.price) || !std::isfinite(fused.standardError) ||
-                        std::abs(fused.price - separate.price) > 1e-10 * std::max(1.0, std::abs(separate.price)) ||
-                        std::abs(fused.standardError - separate.standardError) > 1e-10 * std::max(1.0, separate.standardError)) {
-                        throw std::runtime_error("Fused/separate mismatch for N=" + std::to_string(n));
-                    }
-                }
+            // Expiration makes every payoff exactly 10. Inspect each summary
+            // to verify inactive lanes are excluded from partial-block counts.
+            const auto blocks = (n - 1) / reductionThreads + 1;
+            DeviceBuffer<Moments> output(blocks * sizeof(Moments));
+            simulateAndReduce<<<static_cast<unsigned int>(blocks), reductionThreads>>>(
+                110, 100, 0, 0, 1, 42, n, output.data);
+            checkCuda(cudaGetLastError(), "test fused launch");
+            checkCuda(cudaDeviceSynchronize(), "test fused execution");
+            std::vector<Moments> partials(blocks);
+            checkCuda(cudaMemcpy(partials.data(), output.data, blocks * sizeof(Moments),
+                                 cudaMemcpyDeviceToHost), "download summaries");
+            for (long long b = 0; b < blocks; ++b) {
+                require(partials[b].count == std::min(static_cast<long long>(reductionThreads),
+                                                     n - b * reductionThreads), "Wrong block count");
+                require(partials[b].mean == 10 && partials[b].m2 == 0, "Wrong constant summary");
+            }
+            for (const OptionParams params : {OptionParams{110,100,.05,.2,0},
+                                             OptionParams{90,100,.05,.2,0},
+                                             OptionParams{100,100,.05,0,1}}) {
+                const double expected = std::max(params.spot - params.strike *
+                                                 std::exp(-params.rate * params.maturity), 0.0);
+                const auto result = priceEuropeanCallGPU(params, n, 42);
+                require(std::abs(result.price - expected) < 1e-10 && result.standardError == 0,
+                        "Deterministic pricing mismatch");
             }
         }
-        std::cout << "GPU reduction checks passed (partial blocks, constant payoffs, large-offset variance, fused/separate equivalence).\n";
+        const OptionParams params{100,100,.05,.2,1};
+        for (unsigned long long seed : {42ULL, 123ULL}) {
+            const auto result = priceEuropeanCallGPU(params, 1000000, seed);
+            const auto repeat = priceEuropeanCallGPU(params, 1000000, seed);
+            require(std::isfinite(result.price) && std::isfinite(result.standardError) &&
+                    result.standardError > 0, "Invalid stochastic result");
+            require(result.price == repeat.price && result.standardError == repeat.standardError,
+                    "Seed reproducibility failed");
+            // Loose statistical smoke check against the known analytical price;
+            // deterministic checks above establish exact boundary behavior.
+            require(std::abs(result.price - 10.450583572185565) < 6 * result.standardError,
+                    "Price outside six-standard-error reference bound");
+        }
+        for (long long n : {0LL, 1LL}) {
+            bool rejected = false;
+            try { priceEuropeanCallGPU(params, n, 42); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            require(rejected, "Invalid simulation count accepted");
+        }
+        std::cout << "Fused GPU checks passed (block counts, deterministic prices, reproducibility, analytical reference).\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

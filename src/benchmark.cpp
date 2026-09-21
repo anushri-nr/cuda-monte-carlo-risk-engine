@@ -106,14 +106,14 @@ int main() {
                 writeRow("cpu", n, repetition, cpu, analytical);
                 cpuTimes.push_back(cpu.totalMs);
 #ifdef RISK_ENGINE_HAS_CUDA
-                writeRow("gpu_fused", n, repetition, gpu, analytical);
+                writeRow("gpu", n, repetition, gpu, analytical);
                 gpuTimes.push_back(gpu.totalMs);
 #endif
             }
             std::cerr << "Paths: " << n << '\n';
             const double cpuMedian = summarize("CPU", cpuTimes);
 #ifdef RISK_ENGINE_HAS_CUDA
-            const double gpuMedian = summarize("GPU fused", gpuTimes);
+            const double gpuMedian = summarize("GPU", gpuTimes);
             std::cerr << "  Speedup (CPU median / GPU median): " << cpuMedian / gpuMedian << "x\n";
 #else
             (void)cpuMedian;

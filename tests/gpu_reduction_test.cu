@@ -1,4 +1,4 @@
-// Standalone CUDA checks for the fused kernel and its public pricing interface.
+// Standalone CUDA checks for the pricing kernel and its public pricing interface.
 #include "../src/gpu_pricer.cu"
 #include <algorithm>
 #include <iostream>
@@ -16,8 +16,8 @@ int main() {
             DeviceBuffer<Moments> output(blocks * sizeof(Moments));
             simulateAndReduce<<<static_cast<unsigned int>(blocks), reductionThreads>>>(
                 110, 100, 0, 0, 1, 42, n, output.data);
-            checkCuda(cudaGetLastError(), "test fused launch");
-            checkCuda(cudaDeviceSynchronize(), "test fused execution");
+            checkCuda(cudaGetLastError(), "test kernel launch");
+            checkCuda(cudaDeviceSynchronize(), "test kernel execution");
             std::vector<Moments> partials(blocks);
             checkCuda(cudaMemcpy(partials.data(), output.data, blocks * sizeof(Moments),
                                  cudaMemcpyDeviceToHost), "download summaries");
@@ -55,7 +55,7 @@ int main() {
             catch (const std::invalid_argument&) { rejected = true; }
             require(rejected, "Invalid simulation count accepted");
         }
-        std::cout << "Fused GPU checks passed (block counts, deterministic prices, reproducibility, analytical reference).\n";
+        std::cout << "GPU checks passed (block counts, deterministic prices, reproducibility, analytical reference).\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

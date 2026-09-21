@@ -25,7 +25,7 @@ struct DeviceBuffer {
         if (bytes == 0) return;
         checkCuda(cudaMalloc(reinterpret_cast<void**>(&data), bytes), "cudaMalloc");
     }
-    ~DeviceBuffer() { cudaFree(data); }
+    ~DeviceBuffer() { if (data) cudaFree(data); }
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 };
@@ -59,6 +59,27 @@ __host__ __device__ Moments mergeMoments(Moments a, Moments b) {
             a.m2 + b.m2 + delta * delta * static_cast<double>(a.count) * weight};
 }
 
+// Shared by both GPU implementations so only aggregation and transfers differ.
+__device__ double generatePayoff(
+    float spot, float strike, float drift, float diffusion, float discount,
+    unsigned long long seed, unsigned long long path
+) {
+    curandStatePhilox4_32_10_t state;
+    curand_init(seed, path, 0, &state);
+    const float z = curand_normal(&state);
+    const float futurePrice = spot * expf(drift + diffusion * z);
+    const float payoff = discount * fmaxf(futurePrice - strike, 0.0f);
+    return static_cast<double>(payoff);
+}
+
+__global__ void simulatePayoffs(
+    float spot, float strike, float drift, float diffusion, float discount,
+    unsigned long long seed, long long n, double* payoffs
+) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) payoffs[i] = generatePayoff(spot, strike, drift, diffusion, discount, seed, i);
+}
+
 // No payoff array: samples enter the shared-memory reduction directly.
 __global__ void simulateAndReduce(
     float spot, float strike, float drift, float diffusion, float discount,
@@ -69,13 +90,7 @@ __global__ void simulateAndReduce(
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + tid;
     Moments value{0, 0.0, 0.0};
     if (i < n) {
-        curandStatePhilox4_32_10_t state;
-        curand_init(seed, static_cast<unsigned long long>(i), 0, &state);
-        const float z = curand_normal(&state);
-        const float futurePrice = spot * expf(drift + diffusion * z);
-        const float payoff = discount * fmaxf(futurePrice - strike, 0.0f);
-        // Promote before statistical accumulation; moments remain double precision.
-        value = {1, static_cast<double>(payoff), 0.0};
+        value = {1, generatePayoff(spot, strike, drift, diffusion, discount, seed, i), 0.0};
     }
     shared[tid] = value;
     __syncthreads();
@@ -89,7 +104,7 @@ __global__ void simulateAndReduce(
 
 MonteCarloResult priceEuropeanCallGPU(
     const OptionParams& params, long long numSimulations, unsigned long long seed,
-    GpuTimings* timings
+    GpuTimings* timings, GpuAggregation aggregation
 ) {
     if (numSimulations < 2) {
         throw std::invalid_argument("At least two simulations are required to estimate standard error");
@@ -114,9 +129,18 @@ MonteCarloResult priceEuropeanCallGPU(
         throw std::invalid_argument("Simulation count exceeds device or allocation limits");
     }
 
+    const bool reduceOnGPU = aggregation == GpuAggregation::GPU;
+    if (!reduceOnGPU && static_cast<unsigned long long>(numSimulations) >
+        std::numeric_limits<std::size_t>::max() / sizeof(double)) {
+        throw std::invalid_argument("Payoff allocation exceeds addressable memory");
+    }
+    const auto payoffCount = reduceOnGPU ? 0 : static_cast<std::size_t>(numSimulations);
+    const auto payoffBytes = payoffCount * sizeof(double);
     const auto partialBytes = static_cast<std::size_t>(blocks) * sizeof(Moments);
-    std::vector<Moments> partials(static_cast<std::size_t>(blocks));
-    DeviceBuffer<Moments> devicePartials(partialBytes);
+    std::vector<Moments> partials(reduceOnGPU ? static_cast<std::size_t>(blocks) : 0);
+    std::vector<double> payoffs(payoffCount);
+    DeviceBuffer<double> devicePayoffs(payoffBytes);
+    DeviceBuffer<Moments> devicePartials(reduceOnGPU ? partialBytes : 0);
     const double drift = (params.rate - 0.5 * params.volatility * params.volatility) * params.maturity;
     const double diffusion = params.volatility * std::sqrt(params.maturity);
     const double discount = std::exp(-params.rate * params.maturity);
@@ -135,25 +159,44 @@ MonteCarloResult priceEuropeanCallGPU(
     CudaEvent kernelStart;
     CudaEvent kernelEnd;
     checkCuda(cudaEventRecord(kernelStart.event), "record kernel start");
-    simulateAndReduce<<<static_cast<unsigned int>(blocks), threads>>>(
-        spot, strike, driftF, diffusionF, discountF,
-        seed, numSimulations, devicePartials.data);
-    checkCuda(cudaGetLastError(), "simulateAndReduce launch");
+    if (reduceOnGPU) {
+        simulateAndReduce<<<static_cast<unsigned int>(blocks), threads>>>(
+            spot, strike, driftF, diffusionF, discountF,
+            seed, numSimulations, devicePartials.data);
+    } else {
+        simulatePayoffs<<<static_cast<unsigned int>(blocks), threads>>>(
+            spot, strike, driftF, diffusionF, discountF,
+            seed, numSimulations, devicePayoffs.data);
+    }
+    checkCuda(cudaGetLastError(), "GPU pricing kernel launch");
     checkCuda(cudaEventRecord(kernelEnd.event), "record kernel end");
-    checkCuda(cudaEventSynchronize(kernelEnd.event), "simulateAndReduce execution");
+    checkCuda(cudaEventSynchronize(kernelEnd.event), "GPU pricing kernel execution");
     float kernelMs = 0.0f;
     checkCuda(cudaEventElapsedTime(&kernelMs, kernelStart.event, kernelEnd.event),
               "measure kernel time");
 
     const auto transferStart = std::chrono::steady_clock::now();
-    checkCuda(cudaMemcpy(partials.data(), devicePartials.data, partialBytes, cudaMemcpyDeviceToHost),
-              "cudaMemcpy block summaries to host");
+    if (reduceOnGPU) {
+        checkCuda(cudaMemcpy(partials.data(), devicePartials.data, partialBytes, cudaMemcpyDeviceToHost),
+                  "copy block statistics to host");
+    } else {
+        checkCuda(cudaMemcpy(payoffs.data(), devicePayoffs.data, payoffBytes, cudaMemcpyDeviceToHost),
+                  "copy payoffs to host");
+    }
     const auto transferEnd = std::chrono::steady_clock::now();
 
     const auto aggregationStart = std::chrono::steady_clock::now();
     Moments total{0, 0.0, 0.0};
-    for (const auto& partial : partials) {
-        total = mergeMoments(total, partial);
+    if (reduceOnGPU) {
+        for (const auto& partial : partials) total = mergeMoments(total, partial);
+    } else {
+        // Sequential Welford accumulation of the same discounted GPU samples.
+        for (double payoff : payoffs) {
+            ++total.count;
+            const double delta = payoff - total.mean;
+            total.mean += delta / static_cast<double>(total.count);
+            total.m2 += delta * (payoff - total.mean);
+        }
     }
     const double variance = total.m2 / static_cast<double>(numSimulations - 1);
     const MonteCarloResult result{total.mean, std::sqrt(variance / static_cast<double>(numSimulations))};

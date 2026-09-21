@@ -37,28 +37,31 @@ int main() {
                   << "Pricing time (ms): " << elapsed.count() << '\n';
 
 #ifdef RISK_ENGINE_HAS_CUDA
-        // Run the full workload once to initialize CUDA and load the kernel.
-        // Reusing the seed keeps the reported sample unchanged.
-        priceEuropeanCallGPU(params, numSimulations, seed);
-        GpuTimings gpuTimings{};
-        const auto gpuStart = std::chrono::steady_clock::now();
-        const auto gpuResult = priceEuropeanCallGPU(params, numSimulations, seed, &gpuTimings);
-        const auto gpuEnd = std::chrono::steady_clock::now();
-        const std::chrono::duration<double, std::milli> gpuElapsed = gpuEnd - gpuStart;
-        const double gpuMargin = 1.96 * gpuResult.standardError;
-        std::cout << "\nGPU Monte Carlo European call\n"
-                  << std::fixed << std::setprecision(6)
-                  << "Estimated price: " << gpuResult.price << '\n'
-                  << "Standard error: " << gpuResult.standardError << '\n'
-                  << "Approximate 95% confidence interval: ["
-                  << gpuResult.price - gpuMargin << ", " << gpuResult.price + gpuMargin << "]\n"
-                  << "Black-Scholes price: " << analyticalPrice << '\n'
-                  << "Absolute error: " << std::abs(gpuResult.price - analyticalPrice) << '\n'
-                  << std::setprecision(3)
-                  << "Kernel time (ms, CUDA events): " << gpuTimings.kernelMs << '\n'
-                  << "Device-to-host copy time (ms, wall clock): " << gpuTimings.transferMs << '\n'
-                  << "CPU summary merge time (ms): " << gpuTimings.aggregationMs << '\n'
-                  << "Warmed end-to-end time (ms): " << gpuElapsed.count() << '\n';
+        for (const auto aggregation : {GpuAggregation::CPU, GpuAggregation::GPU}) {
+            // Run the full workload once to initialize CUDA and load the kernel.
+            // Reusing the seed keeps the reported sample unchanged.
+            priceEuropeanCallGPU(params, numSimulations, seed, nullptr, aggregation);
+            GpuTimings gpuTimings{};
+            const auto gpuStart = std::chrono::steady_clock::now();
+            const auto gpuResult = priceEuropeanCallGPU(params, numSimulations, seed, &gpuTimings, aggregation);
+            const auto gpuEnd = std::chrono::steady_clock::now();
+            const std::chrono::duration<double, std::milli> gpuElapsed = gpuEnd - gpuStart;
+            const double gpuMargin = 1.96 * gpuResult.standardError;
+            std::cout << "\n" << (aggregation == GpuAggregation::GPU
+                        ? "GPU with reduction" : "GPU without reduction") << '\n'
+                      << std::fixed << std::setprecision(6)
+                      << "Estimated price: " << gpuResult.price << '\n'
+                      << "Standard error: " << gpuResult.standardError << '\n'
+                      << "Approximate 95% confidence interval: ["
+                      << gpuResult.price - gpuMargin << ", " << gpuResult.price + gpuMargin << "]\n"
+                      << "Black-Scholes price: " << analyticalPrice << '\n'
+                      << "Absolute error: " << std::abs(gpuResult.price - analyticalPrice) << '\n'
+                      << std::setprecision(3)
+                      << "Kernel time (ms, CUDA events): " << gpuTimings.kernelMs << '\n'
+                      << "Device-to-host copy time (ms, wall clock): " << gpuTimings.transferMs << '\n'
+                      << "CPU aggregation time (ms): " << gpuTimings.aggregationMs << '\n'
+                      << "Warmed end-to-end time (ms): " << gpuElapsed.count() << '\n';
+        }
 #endif
     } catch (const std::exception& error) {
         std::cerr << "Pricing failed: " << error.what() << '\n';

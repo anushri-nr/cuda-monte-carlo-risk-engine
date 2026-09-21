@@ -104,13 +104,28 @@ int main() {
         }
         require(std::abs(sumError / sampleCount) < 1e-5 && maxError < 1e-3,
                 "Payoff precision error exceeds tolerance");
+        // Identical samples must agree regardless of aggregation location.
+        for (long long n : {2LL, 255LL, 256LL, 257LL, 1025LL, 100000LL}) {
+            for (const OptionParams p : {params, OptionParams{80,100,-.01,.4,2},
+                                        OptionParams{110,100,.05,.2,0},
+                                        OptionParams{100,100,.05,0,1}}) {
+                for (unsigned long long seed : {42ULL, 123ULL}) {
+                    const auto host = priceEuropeanCallGPU(p, n, seed, nullptr, GpuAggregation::CPU);
+                    const auto device = priceEuropeanCallGPU(p, n, seed, nullptr, GpuAggregation::GPU);
+                    require(std::abs(host.price - device.price) < 1e-9 * std::max(1.0, std::abs(device.price)) &&
+                            std::abs(host.standardError - device.standardError) <
+                                1e-9 * std::max(1.0, device.standardError),
+                            "GPU aggregation methods disagree");
+                }
+            }
+        }
         for (long long n : {0LL, 1LL}) {
             bool rejected = false;
             try { priceEuropeanCallGPU(params, n, 42); }
             catch (const std::invalid_argument&) { rejected = true; }
             require(rejected, "Invalid simulation count accepted");
         }
-        std::cout << "GPU checks passed (block counts, deterministic prices, reproducibility, analytical reference, payoff precision).\n";
+        std::cout << "GPU checks passed (block counts, deterministic prices, reproducibility, analytical reference, payoff precision, aggregation agreement).\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

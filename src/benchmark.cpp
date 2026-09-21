@@ -5,6 +5,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <exception>
@@ -31,10 +32,10 @@ Measurement measureCPU(const OptionParams& params, long long n) {
     return {result, std::chrono::duration<double, std::milli>(Clock::now() - start).count()};
 }
 #ifdef RISK_ENGINE_HAS_CUDA
-Measurement measureGPU(const OptionParams& params, long long n) {
+Measurement measureGPU(const OptionParams& params, long long n, GpuAggregation aggregation) {
     GpuTimings stages{};
     const auto start = Clock::now();
-    const auto result = priceEuropeanCallGPU(params, n, 42, &stages);
+    const auto result = priceEuropeanCallGPU(params, n, 42, &stages, aggregation);
     const double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     return {result, elapsed, stages};
 }
@@ -75,48 +76,51 @@ int main() {
         const OptionParams params{100, 100, .05, .2, 1};
         const double analytical = priceEuropeanCallBlackScholes(params);
         std::cout << std::setprecision(12)
-                  << "backend,paths,repetition,seed,price,standard_error,black_scholes,absolute_error,total_ms,kernel_ms,transfer_ms,merge_ms\n";
+                  << "backend,paths,repetition,seed,price,standard_error,black_scholes,absolute_error,total_ms,kernel_ms,transfer_ms,aggregation_ms\n";
         std::cerr << std::fixed << std::setprecision(3)
                   << "7 measured repetitions per size; one full warm-up per backend per size.\n"
                   << "Fixed seed 42 measures timing variability, not independent pricing trials.\n";
         for (long long n : {10'000LL, 100'000LL, 1'000'000LL, 10'000'000LL}) {
-            // Warm-up occurs in this process and is excluded from reported data.
-            measureCPU(params, n);
 #ifdef RISK_ENGINE_HAS_CUDA
-            measureGPU(params, n);
-            std::vector<double> gpuTimes;
-#endif
-            std::vector<double> cpuTimes;
-            for (int repetition = 1; repetition <= repetitions; ++repetition) {
-                Measurement cpu{};
-#ifdef RISK_ENGINE_HAS_CUDA
-                Measurement gpu{};
-                // Alternate order to reduce systematic CPU-first/GPU-first bias.
-                if (repetition % 2) {
-                    cpu = measureCPU(params, n);
-                    gpu = measureGPU(params, n);
-                } else {
-                    gpu = measureGPU(params, n);
-                    cpu = measureCPU(params, n);
-                }
+            constexpr int backendCount = 3;
+            const std::array<const char*, backendCount> names{
+                "cpu", "gpu_no_reduction", "gpu_reduction"};
 #else
-                cpu = measureCPU(params, n);
+            constexpr int backendCount = 1;
+            const std::array<const char*, backendCount> names{"cpu"};
 #endif
-                // Console/file writes happen outside the measured calls.
-                writeRow("cpu", n, repetition, cpu, analytical);
-                cpuTimes.push_back(cpu.totalMs);
+            const auto measure = [&](int backend) {
 #ifdef RISK_ENGINE_HAS_CUDA
-                writeRow("gpu", n, repetition, gpu, analytical);
-                gpuTimes.push_back(gpu.totalMs);
+                if (backend != 0) return measureGPU(params, n,
+                    backend == 1 ? GpuAggregation::CPU : GpuAggregation::GPU);
+#else
+                (void)backend;
 #endif
+                return measureCPU(params, n);
+            };
+            for (int backend = 0; backend < backendCount; ++backend) measure(backend);
+            std::array<std::vector<double>, backendCount> times;
+            for (int repetition = 1; repetition <= repetitions; ++repetition) {
+                std::array<Measurement, backendCount> measurements{};
+                // Rotate the first backend to distribute execution-order effects.
+                for (int offset = 0; offset < backendCount; ++offset) {
+                    const int backend = (repetition - 1 + offset) % backendCount;
+                    measurements[backend] = measure(backend);
+                }
+                for (int backend = 0; backend < backendCount; ++backend) {
+                    writeRow(names[backend], n, repetition, measurements[backend], analytical);
+                    times[backend].push_back(measurements[backend].totalMs);
+                }
             }
             std::cerr << "Paths: " << n << '\n';
-            const double cpuMedian = summarize("CPU", cpuTimes);
+            std::array<double, backendCount> medians{};
+            for (int backend = 0; backend < backendCount; ++backend) {
+                medians[backend] = summarize(names[backend], times[backend]);
+            }
 #ifdef RISK_ENGINE_HAS_CUDA
-            const double gpuMedian = summarize("GPU", gpuTimes);
-            std::cerr << "  Speedup (CPU median / GPU median): " << cpuMedian / gpuMedian << "x\n";
-#else
-            (void)cpuMedian;
+            std::cerr << "  CPU / GPU without reduction: " << medians[0] / medians[1] << "x\n"
+                      << "  CPU / GPU with reduction: " << medians[0] / medians[2] << "x\n"
+                      << "  GPU without / with reduction: " << medians[1] / medians[2] << "x\n";
 #endif
         }
         if (!std::cout) throw std::runtime_error("Failed to write benchmark CSV");

@@ -1,142 +1,217 @@
 # CUDA Monte Carlo Risk Engine
 
-GPU-accelerated European option pricing in C++17 and CUDA, with statistical
-error estimates, Black–Scholes validation, and CPU/GPU benchmarks.
+European call option pricing in C++17 and CUDA, with analytical validation,
+statistical error estimates, and reproducible CPU/GPU benchmarks.
 
-## Features
+## Implementations
 
-- European call pricing for a non-dividend-paying stock.
-- Serial CPU simulation and GPU simulation with cuRAND Philox random numbers.
-- Shared-memory reduction of payoff statistics and a final CPU merge.
-- Standard error and approximate 95% confidence intervals.
-- Analytical Black–Scholes pricing for validation.
-- Repeated benchmarks with CSV output and per-stage GPU timings.
+The project compares three ways to price the same option:
 
-## How it works
+| Implementation | Simulation | Aggregation | Data returned from GPU |
+|---|---|---|---|
+| `cpu` | Serial CPU | CPU | None |
+| `gpu_no_reduction` | GPU, one path per thread | CPU | Every discounted payoff |
+| `gpu_reduction` | GPU, one path per thread | GPU block statistics, then CPU merge | One statistical summary per block |
 
-Each path samples the stock price at expiration under geometric Brownian motion:
+Both GPU implementations use the same payoff-generation function, cuRAND Philox
+subsequences, seed, and arithmetic precision. Their comparison isolates the
+choice of aggregation location and the resulting allocation and transfer costs.
+The CPU uses a different random generator, so its comparison also reflects
+backend and arithmetic differences; this is not a comparison with a vectorized
+or multithreaded CPU implementation.
+
+## Pricing model
+
+For a European call on a non-dividend-paying stock, each path samples its
+risk-neutral terminal price and discounted payoff:
 
 ```text
-S(T) = S(0) × exp((r − σ²/2)T + σ√T × Z),   Z ~ N(0, 1)
-payoff = exp(−rT) × max(S(T) − K, 0)
+Z ~ N(0, 1)
+S(T) = S(0) × exp((r − σ²/2)T + σ√T × Z)
+X = exp(−rT) × max(S(T) − K, 0)
 ```
 
-The estimated option price is the mean discounted payoff. Sample variance gives
-its standard error; the approximate 95% confidence interval is the price plus
-or minus 1.96 standard errors.
+The option price is estimated by the mean of `X`. With sample standard deviation
+`s` and `N` paths, the standard error is `s / √N`; the approximate 95% confidence
+interval is `price ± 1.96 × standard_error`. Black–Scholes provides an analytical
+reference for the same model. Sampling error is expected, and a single interval
+can miss the reference by chance.
 
-On the GPU, each thread generates one payoff. Threads cooperate in blocks of
-256 to calculate counts, means, and squared deviations in shared memory. Only
-block summaries are written to global memory and copied to the CPU for the
-final calculation. GPU normal samples and payoff arithmetic use single precision;
-block statistics and the final merge use double precision. Model coefficients
-are calculated in double precision on the CPU before conversion for the kernel.
-CPU pricing uses double precision throughout. CPU and GPU random generators
-differ, so the same seed does not imply identical estimates across backends.
+The example uses spot 100, strike 100, annual risk-free rate 5%, annual volatility
+20%, maturity one year, one million paths, and seed 42. Inputs are currently
+specified in `src/main.cpp` and `src/benchmark.cpp`. Both pricers require at least
+two paths so sample variance is defined. The current scope is European call
+pricing.
 
-## Requirements
+## Implementation details and rationale
 
-| Build | Requirements |
-|---|---|
-| CPU | CMake 3.18+ and a C++17 compiler |
-| GPU | CPU requirements, CUDA toolkit, and a compatible NVIDIA GPU |
+### CPU
 
-The GPU implementation has been built and tested on a Tesla T4 with CUDA 12.8.
+The CPU draws normal samples with `std::mt19937_64` and
+`std::normal_distribution<double>`. It uses double precision throughout and
+Welford's online algorithm to accumulate mean and squared deviations without
+storing every payoff. Drift and diffusion coefficients are computed once per
+call, since they are shared by all paths.
+
+### GPU simulation
+
+Each thread uses its path index as a Philox subsequence identifier. This makes
+sampling repeatable within the same implementation and environment and gives
+both GPU paths the same samples. CPU and GPU seeds do not imply matching samples.
+
+Normal sampling and individual payoff arithmetic use `float`; each payoff is
+promoted to `double` before statistical accumulation. This reduces expensive
+double-precision arithmetic during simulation while retaining double precision
+for variance and mean calculations. Coefficients are computed in double precision
+on the host and converted for the kernel. GPU inputs outside representable
+single-precision ranges and non-finite aggregate results are rejected.
+
+Single-precision payoffs can introduce rounding error, particularly near the
+strike or at extreme parameter scales. Same-sample accuracy tests distinguish
+payoff rounding from Monte Carlo sampling error. Passing those tests does not
+establish accuracy for every parameter combination.
+
+### GPU without reduction
+
+The kernel writes one promoted, double-precision discounted payoff per path.
+The entire array is copied to the CPU, which uses sequential Welford accumulation.
+This implementation demonstrates the cost of returning individual outcomes:
+its GPU output buffer, host buffer, and return transfer each contain `8 × N`
+bytes. At 10 million paths, the return transfer is 80 MB.
+
+### GPU with reduction
+
+Blocks of 256 threads combine payoffs in shared memory during the simulation
+kernel. Each block outputs a count, mean, and sum of squared deviations (`M2`).
+The CPU merges these summaries to produce the final price and standard error.
+There is no intermediate global-memory payoff array.
+
+For two nonempty groups A and B:
+
+```text
+n = nA + nB
+delta = meanB − meanA
+weight = nB / n
+mean = meanA + delta × weight
+M2 = M2A + M2B + delta² × nA × weight
+```
+
+These formulas combine variance statistics without subtracting a large squared
+mean from a sum of squares. Equal-size groups use the exact weight `0.5`, avoiding
+division in the common case. Unequal groups retain the general formula, and empty
+groups contribute nothing. Threads beyond the requested path count contribute
+empty statistics and still reach every synchronization barrier.
+
+Each summary occupies 24 bytes on the tested CUDA platform. For 10 million paths,
+39,063 summaries require 937,512 bytes, versus 80 MB for individual payoffs.
+Final CPU work scales with the number of blocks rather than the number of paths.
+
+### Memory ownership and timing
+
+Every pricing call allocates, uses, and releases its own buffers and timing
+events. Resource-owning wrappers clean up when exceptions occur. CUDA launch and
+execution failures are checked before results are returned. Buffers are not
+retained between benchmark calls: total timings represent independent calls
+within an initialized process.
 
 ## Build and run
 
-From the repository root, build the CPU version:
+Requirements: CMake 3.18+ and a C++17 compiler. GPU builds additionally require a
+CUDA toolkit and compatible NVIDIA GPU. The GPU implementation has been developed
+on a Tesla T4 with CUDA 12.8; the current three-way comparison must be measured
+on the target system.
+
+CPU build:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j2
+ctest --test-dir build --output-on-failure
 ./build/risk_engine
 ```
 
-To enable CUDA on a Tesla T4:
+GPU build for a Tesla T4:
 
 ```sh
 cmake -S . -B build-gpu -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
 cmake --build build-gpu -j2
+ctest --test-dir build-gpu --output-on-failure
 ./build-gpu/risk_engine
 ```
 
-Set `CMAKE_CUDA_ARCHITECTURES` to match your GPU. In a Colab GPU runtime, run
-shell commands with a `!` prefix and use `%cd` to enter the repository directory.
+Set `CMAKE_CUDA_ARCHITECTURES` to match your GPU. In Colab, select a GPU runtime,
+use `%cd` to enter the repository, and prefix shell commands with `!`.
+The GPU executable displays results for all three implementations.
 
-The example prices one million paths with seed 42 using these inputs:
+## Correctness checks
 
-| Parameter | Value |
-|---|---:|
-| Stock price | 100 |
-| Strike price | 100 |
-| Annual risk-free rate | 5% |
-| Annual volatility | 20% |
-| Time to expiration | 1 year |
+CTest runs CPU checks and, when CUDA is enabled, GPU checks. Coverage includes:
 
-The program prints the estimated price, standard error, confidence interval,
-Black–Scholes price, absolute error, and execution times. Both pricing functions
-require at least two paths to estimate sample variance.
+- The analytical reference price and deterministic expiration/zero-volatility cases.
+- Invalid path counts, repeatability, and statistical agreement with Black–Scholes.
+- Equal, unequal, and empty statistical merges, and counts in partially filled blocks.
+- Payoff rounding against a double-precision calculation using identical samples.
+- Agreement between both GPU aggregation paths over multiple seeds, path counts,
+  and option inputs, allowing for floating-point summation order.
 
-## Tests
+Statistical checks use a loose six-standard-error bound; they are smoke checks,
+not a proof of unbiasedness. The deterministic GPU price tolerance is `1e-4`.
+For the example inputs, the rounding check requires absolute mean error below
+`1e-5` and maximum per-path error below `1e-3` across 100,000 samples.
 
-After configuring the GPU build, compile and run the CUDA checks:
+## Benchmarks and results
+
+Run tests first, then save a benchmark with environment metadata (Python 3):
 
 ```sh
-nvcc -std=c++17 -O2 -arch=sm_75 -Iinclude tests/gpu_reduction_test.cu -o build-gpu/gpu_reduction_test
-./build-gpu/gpu_reduction_test
+python3 scripts/run_benchmarks.py --build-dir build-gpu
 ```
 
-Tests cover partial-block counts, expiration, zero volatility, reproducibility,
-invalid path counts, analytical pricing, and payoff rounding error against a
-double-precision reference. CUDA tests require an NVIDIA GPU.
+The script creates a new timestamped directory under `benchmarks/` containing
+`results.csv`, `summary.txt`, `environment.json`, and the CMake cache. It records
+the commit, working-tree status, compiler versions, and hardware information.
+An explicit `--output` directory must not already exist. Use `--build-dir build`
+for CPU-only results. Download Colab results before its runtime expires.
 
-## Benchmarks
+For direct execution:
 
 ```sh
 ./build-gpu/risk_benchmark > benchmarks/results.csv 2> benchmarks/summary.txt
-cat benchmarks/summary.txt
 ```
 
-Use `./build/risk_benchmark` for CPU-only measurements.
+### Measurement protocol
 
-The benchmark measures 10K, 100K, 1M, and 10M paths. Each backend receives one
-warm-up per size, followed by seven measured repetitions with alternating
-CPU/GPU execution order. Inputs and seed stay fixed to measure timing
-variability. The summary reports median times, min/max ranges, and the ratio
-of CPU median time to GPU median time.
+- 10K, 100K, 1M, and 10M paths with the example option inputs and fixed seed 42.
+- One full warm-up per implementation per size, then seven measured repetitions.
+- Rotating implementation order to distribute order effects (seven repetitions
+  cannot balance three implementations perfectly).
+- Median and min/max total times for each implementation; speedup is the ratio
+  of medians, with separate CPU/GPU and GPU/GPU comparisons.
 
-CSV rows identify the `cpu` or `gpu` backend and contain path count, repetition,
-seed, price, standard error, analytical price, absolute error, total time,
-kernel time, transfer time, and CPU merge time. GPU stage fields are blank for
-CPU rows.
+Warm-up excludes one-time initialization from the measured calls. Every measured
+call still includes allocation, synchronization, transfers, CPU aggregation,
+timing instrumentation, and cleanup. CSV and console writes occur outside timing.
+Fixed seeds make repetitions timing trials, not independent pricing trials.
 
-Kernel time uses CUDA events. Transfer, CPU merge, and total time use wall-clock
-measurements. GPU total time includes allocation, synchronization, timing
-instrumentation, transfers, and cleanup; warm-up and console output are excluded.
-Stage times omit setup and cleanup, so they do not sum to total time.
+CSV columns are `backend`, `paths`, `repetition`, `seed`, `price`, `standard_error`,
+`black_scholes`, `absolute_error`, `total_ms`, `kernel_ms`, `transfer_ms`, and
+`aggregation_ms`. GPU fields are blank for CPU rows. Kernel time uses CUDA events;
+transfer, aggregation, and total time use a steady host clock. With GPU reduction,
+kernel time includes simulation and block aggregation. Stage times omit setup and
+cleanup and therefore need not sum to total time.
 
-For reproducible results, save the commit, compiler versions, GPU/CPU details,
-and build configuration alongside the measurements:
-
-```sh
-git rev-parse HEAD > benchmarks/environment.txt
-nvidia-smi >> benchmarks/environment.txt
-nvcc --version >> benchmarks/environment.txt
-c++ --version >> benchmarks/environment.txt
-lscpu >> benchmarks/environment.txt
-cat build-gpu/CMakeCache.txt >> benchmarks/environment.txt
-```
-
-These environment commands target Linux, including Colab. GPU clocks and cloud
-resource conditions can affect timings. Report medians and ranges, and save
-Colab output files before the runtime expires.
+GPU clocks and cloud scheduling can affect results. Compare all three methods
+within the same run, retain timing ranges, and report hardware and precision
+alongside speedups. Profiler-instrumented times are not benchmark results.
+No performance table is hard-coded here; generate the complete comparison from
+the current executable rather than combining measurements from different builds.
 
 ## Project structure
 
 ```text
 include/       Shared option parameters and result types
-src/           CPU/GPU pricing, Black–Scholes, example, and benchmarks
-tests/         CUDA correctness checks
-benchmarks/    Benchmark output and environment records
+src/           CPU/GPU pricing, analytical pricing, example, and benchmark
+tests/        CPU and CUDA correctness checks
+scripts/       Benchmark collection and environment capture
+benchmarks/    Saved measurements
 ```

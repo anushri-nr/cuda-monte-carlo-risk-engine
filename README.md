@@ -160,3 +160,32 @@ information alongside results for reproducibility:
 Download the results, summary, and environment files before the Colab runtime
 expires. GPU timings still require an NVIDIA environment; local CPU checks do
 not validate the CUDA benchmark path.
+
+
+## Fused simulation and reduction
+
+The default GPU method now generates each payoff and immediately reduces it
+within the block. It allocates only block summaries, eliminating the intermediate
+payoff buffer (80 MB for 10 million paths) and its write/read traffic. Inactive
+threads still reach every synchronization barrier. Philox path subsequences and
+the reduction tree match the separate-kernel version.
+
+The separate-kernel implementation remains available via `GpuMethod::Separate`.
+The benchmark reports `cpu`, `gpu_fused`, and `gpu_separate` rows, with warm-ups
+for all three and alternating forward/reverse execution order. The fused
+`kernel_ms` includes both simulation and reduction; `reduction_ms` is zero
+because there is no separate reduction launch. Compare fused kernel time to the
+sum of the two separate kernel times, and compare total medians for application
+speedup. CSV column layout is unchanged, but GPU backend labels have changed.
+
+The reduction test now also compares fused and separate results for multiple
+seeds, small and partial blocks, expiration, and zero volatility. These changes
+require compilation and execution on Colab before performance or correctness
+claims can be made for the fused path.
+
+Save this comparison separately to preserve earlier results:
+
+```python
+!./build-gpu/risk_benchmark > benchmarks/results_fused.csv 2> benchmarks/summary_fused.txt
+!cat benchmarks/summary_fused.txt
+```

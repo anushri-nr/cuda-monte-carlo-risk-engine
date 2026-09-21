@@ -31,10 +31,10 @@ Measurement measureCPU(const OptionParams& params, long long n) {
     return {result, std::chrono::duration<double, std::milli>(Clock::now() - start).count()};
 }
 #ifdef RISK_ENGINE_HAS_CUDA
-Measurement measureGPU(const OptionParams& params, long long n) {
+Measurement measureGPU(const OptionParams& params, long long n, GpuMethod method = GpuMethod::Fused) {
     GpuTimings stages{};
     const auto start = Clock::now();
-    const auto result = priceEuropeanCallGPU(params, n, 42, &stages);
+    const auto result = priceEuropeanCallGPU(params, n, 42, &stages, method);
     const double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     return {result, elapsed, stages};
 }
@@ -84,6 +84,8 @@ int main() {
             measureCPU(params, n);
 #ifdef RISK_ENGINE_HAS_CUDA
             measureGPU(params, n);
+            measureGPU(params, n, GpuMethod::Separate);
+            std::vector<double> separateTimes;
             std::vector<double> gpuTimes;
 #endif
             std::vector<double> cpuTimes;
@@ -91,11 +93,14 @@ int main() {
                 Measurement cpu{};
 #ifdef RISK_ENGINE_HAS_CUDA
                 Measurement gpu{};
+                Measurement separate{};
                 // Alternate order to reduce systematic CPU-first/GPU-first bias.
                 if (repetition % 2) {
                     cpu = measureCPU(params, n);
                     gpu = measureGPU(params, n);
+                    separate = measureGPU(params, n, GpuMethod::Separate);
                 } else {
+                    separate = measureGPU(params, n, GpuMethod::Separate);
                     gpu = measureGPU(params, n);
                     cpu = measureCPU(params, n);
                 }
@@ -106,14 +111,18 @@ int main() {
                 writeRow("cpu", n, repetition, cpu, analytical);
                 cpuTimes.push_back(cpu.totalMs);
 #ifdef RISK_ENGINE_HAS_CUDA
-                writeRow("gpu", n, repetition, gpu, analytical);
+                writeRow("gpu_fused", n, repetition, gpu, analytical);
+                writeRow("gpu_separate", n, repetition, separate, analytical);
+                separateTimes.push_back(separate.totalMs);
                 gpuTimes.push_back(gpu.totalMs);
 #endif
             }
             std::cerr << "Paths: " << n << '\n';
             const double cpuMedian = summarize("CPU", cpuTimes);
 #ifdef RISK_ENGINE_HAS_CUDA
-            const double gpuMedian = summarize("GPU", gpuTimes);
+            const double gpuMedian = summarize("GPU fused", gpuTimes);
+            const double separateMedian = summarize("GPU separate", separateTimes);
+            std::cerr << "  Separate / fused median: " << separateMedian / gpuMedian << "x\n";
             std::cerr << "  Speedup (CPU median / GPU median): " << cpuMedian / gpuMedian << "x\n";
 #else
             (void)cpuMedian;

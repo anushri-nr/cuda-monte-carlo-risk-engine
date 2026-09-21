@@ -36,7 +36,23 @@ int main() {
                 }
             }
         }
-        std::cout << "GPU reduction checks passed (partial blocks, constant payoffs, large-offset variance).\n";
+        for (long long n : {2LL, 255LL, 256LL, 257LL, 1025LL, 100000LL}) {
+            for (const OptionParams params : {
+                    OptionParams{100,100,.05,.2,1},
+                    OptionParams{110,100,.05,.2,0},
+                    OptionParams{100,100,.05,0,1}}) {
+                for (unsigned long long seed : {42ULL, 123ULL}) {
+                    const auto separate = priceEuropeanCallGPU(params, n, seed, nullptr, GpuMethod::Separate);
+                    const auto fused = priceEuropeanCallGPU(params, n, seed, nullptr, GpuMethod::Fused);
+                    if (!std::isfinite(fused.price) || !std::isfinite(fused.standardError) ||
+                        std::abs(fused.price - separate.price) > 1e-10 * std::max(1.0, std::abs(separate.price)) ||
+                        std::abs(fused.standardError - separate.standardError) > 1e-10 * std::max(1.0, separate.standardError)) {
+                        throw std::runtime_error("Fused/separate mismatch for N=" + std::to_string(n));
+                    }
+                }
+            }
+        }
+        std::cout << "GPU reduction checks passed (partial blocks, constant payoffs, large-offset variance, fused/separate equivalence).\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

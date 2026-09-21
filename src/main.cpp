@@ -46,7 +46,7 @@ int main() {
         const auto gpuEnd = std::chrono::steady_clock::now();
         const std::chrono::duration<double, std::milli> gpuElapsed = gpuEnd - gpuStart;
         const double gpuMargin = 1.96 * gpuResult.standardError;
-        std::cout << "\nGPU Monte Carlo European call (GPU block reduction)\n"
+        std::cout << "\nGPU Monte Carlo European call (fused simulation and reduction)\n"
                   << std::fixed << std::setprecision(6)
                   << "Estimated price: " << gpuResult.price << '\n'
                   << "Standard error: " << gpuResult.standardError << '\n'
@@ -55,8 +55,8 @@ int main() {
                   << "Black-Scholes price: " << analyticalPrice << '\n'
                   << "Absolute error: " << std::abs(gpuResult.price - analyticalPrice) << '\n'
                   << std::setprecision(3)
-                  << "Kernel time (ms, CUDA events): " << gpuTimings.kernelMs << '\n'
-                  << "GPU reduction time (ms, CUDA events): " << gpuTimings.reductionMs << '\n'
+                  << "Fused kernel time (ms, CUDA events): " << gpuTimings.kernelMs << '\n'
+                  << "Separate reduction time (ms, zero when fused): " << gpuTimings.reductionMs << '\n'
                   << "Device-to-host copy time (ms, wall clock): " << gpuTimings.transferMs << '\n'
                   << "CPU summary merge time (ms): " << gpuTimings.aggregationMs << '\n'
                   << "Warmed end-to-end time (ms): " << gpuElapsed.count() << '\n';

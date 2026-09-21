@@ -22,6 +22,7 @@ template <typename T>
 struct DevicePayoffs {
     T* data = nullptr;
     explicit DevicePayoffs(std::size_t bytes) {
+        if (bytes == 0) return;
         checkCuda(cudaMalloc(reinterpret_cast<void**>(&data), bytes), "cudaMalloc");
     }
     ~DevicePayoffs() { cudaFree(data); }
@@ -85,11 +86,35 @@ __global__ void simulatePayoffs(
     const double futurePrice = spot * exp(drift + diffusion * z);
     payoffs[i] = discount * fmax(futurePrice - strike, 0.0);
 }
+// No payoff array: samples enter the shared-memory reduction directly.
+__global__ void simulateAndReduce(
+    double spot, double strike, double drift, double diffusion, double discount,
+    unsigned long long seed, long long n, Moments* partials
+) {
+    __shared__ Moments shared[reductionThreads];
+    const int tid = threadIdx.x;
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + tid;
+    Moments value{0, 0.0, 0.0};
+    if (i < n) {
+        curandStatePhilox4_32_10_t state;
+        curand_init(seed, static_cast<unsigned long long>(i), 0, &state);
+        const double z = curand_normal_double(&state);
+        const double futurePrice = spot * exp(drift + diffusion * z);
+        value = {1, discount * fmax(futurePrice - strike, 0.0), 0.0};
+    }
+    shared[tid] = value;
+    __syncthreads();
+    for (int stride = reductionThreads / 2; stride > 0; stride /= 2) {
+        if (tid < stride) shared[tid] = mergeMoments(shared[tid], shared[tid + stride]);
+        __syncthreads();
+    }
+    if (tid == 0) partials[blockIdx.x] = shared[0];
+}
 } // namespace
 
 MonteCarloResult priceEuropeanCallGPU(
     const OptionParams& params, long long numSimulations, unsigned long long seed,
-    GpuTimings* timings
+    GpuTimings* timings, GpuMethod method
 ) {
     if (numSimulations < 2) {
         throw std::invalid_argument("At least two simulations are required to estimate standard error");
@@ -118,7 +143,7 @@ MonteCarloResult priceEuropeanCallGPU(
     const auto bytes = n * sizeof(double);
     const auto partialBytes = static_cast<std::size_t>(blocks) * sizeof(Moments);
     std::vector<Moments> partials(static_cast<std::size_t>(blocks));
-    DevicePayoffs<double> devicePayoffs(bytes);
+    DevicePayoffs<double> devicePayoffs(method == GpuMethod::Separate ? bytes : 0);
     DevicePayoffs<Moments> devicePartials(partialBytes);
     const double drift = (params.rate - 0.5 * params.volatility * params.volatility) * params.maturity;
     const double diffusion = params.volatility * std::sqrt(params.maturity);
@@ -127,9 +152,15 @@ MonteCarloResult priceEuropeanCallGPU(
     CudaEvent kernelStart;
     CudaEvent kernelEnd;
     checkCuda(cudaEventRecord(kernelStart.event), "record kernel start");
+    if (method == GpuMethod::Fused) {
+        simulateAndReduce<<<static_cast<unsigned int>(blocks), threads>>>(
+            params.spot, params.strike, drift, diffusion, discount,
+            seed, numSimulations, devicePartials.data);
+    } else {
     simulatePayoffs<<<static_cast<unsigned int>(blocks), threads>>>(
         params.spot, params.strike, drift, diffusion, discount,
         seed, numSimulations, devicePayoffs.data);
+    }
     checkCuda(cudaGetLastError(), "simulatePayoffs launch");
     checkCuda(cudaEventRecord(kernelEnd.event), "record kernel end");
     checkCuda(cudaEventSynchronize(kernelEnd.event), "simulatePayoffs execution");
@@ -137,6 +168,8 @@ MonteCarloResult priceEuropeanCallGPU(
     checkCuda(cudaEventElapsedTime(&kernelMs, kernelStart.event, kernelEnd.event),
               "measure kernel time");
 
+    float reductionMs = 0.0f;
+    if (method == GpuMethod::Separate) {
     CudaEvent reductionStart;
     CudaEvent reductionEnd;
     checkCuda(cudaEventRecord(reductionStart.event), "record reduction start");
@@ -145,9 +178,9 @@ MonteCarloResult priceEuropeanCallGPU(
     checkCuda(cudaGetLastError(), "reducePayoffs launch");
     checkCuda(cudaEventRecord(reductionEnd.event), "record reduction end");
     checkCuda(cudaEventSynchronize(reductionEnd.event), "reducePayoffs execution");
-    float reductionMs = 0.0f;
     checkCuda(cudaEventElapsedTime(&reductionMs, reductionStart.event, reductionEnd.event),
               "measure reduction time");
+    }
 
     const auto transferStart = std::chrono::steady_clock::now();
     checkCuda(cudaMemcpy(partials.data(), devicePartials.data, partialBytes, cudaMemcpyDeviceToHost),

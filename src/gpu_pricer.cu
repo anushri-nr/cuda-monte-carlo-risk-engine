@@ -51,7 +51,10 @@ __host__ __device__ Moments mergeMoments(Moments a, Moments b) {
     if (b.count == 0) return a;
     const long long count = a.count + b.count;
     const double delta = b.mean - a.mean;
-    const double weight = static_cast<double>(b.count) / static_cast<double>(count);
+    // Equal-sized groups have an exact half weight.
+    const double weight = a.count == b.count
+        ? 0.5
+        : static_cast<double>(b.count) / static_cast<double>(count);
     return {count, a.mean + delta * weight,
             a.m2 + b.m2 + delta * delta * static_cast<double>(a.count) * weight};
 }

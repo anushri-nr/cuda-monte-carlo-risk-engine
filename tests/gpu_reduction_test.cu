@@ -7,6 +7,14 @@ void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+__global__ void checkMomentMerges(Moments* output) {
+    const Moments a{2, 2.0, 2.0}; // Samples [1, 3].
+    output[0] = mergeMoments(a, Moments{2, 6.0, 2.0}); // [5, 7].
+    output[1] = mergeMoments(a, Moments{1, 8.0, 0.0}); // [8].
+    output[2] = mergeMoments(Moments{0, 0.0, 0.0}, a);
+    output[3] = mergeMoments(a, Moments{0, 0.0, 0.0});
+}
+
 // Use identical normal samples to isolate payoff rounding from RNG differences.
 __global__ void payoffPrecisionCheck(double* errors, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -23,6 +31,21 @@ __global__ void payoffPrecisionCheck(double* errors, int n) {
 
 int main() {
     try {
+        DeviceBuffer<Moments> mergedDevice(4 * sizeof(Moments));
+        checkMomentMerges<<<1, 1>>>(mergedDevice.data);
+        checkCuda(cudaGetLastError(), "moment checks launch");
+        checkCuda(cudaDeviceSynchronize(), "moment checks execution");
+        Moments merged[4];
+        checkCuda(cudaMemcpy(merged, mergedDevice.data, sizeof(merged), cudaMemcpyDeviceToHost),
+                  "download moment checks");
+        const Moments expected[] = {{4, 4.0, 20.0}, {3, 4.0, 26.0},
+                                    {2, 2.0, 2.0}, {2, 2.0, 2.0}};
+        for (int i = 0; i < 4; ++i) {
+            require(merged[i].count == expected[i].count &&
+                    std::abs(merged[i].mean - expected[i].mean) < 1e-12 &&
+                    std::abs(merged[i].m2 - expected[i].m2) < 1e-12,
+                    "Moment merge mismatch");
+        }
         for (long long n : {2LL, 255LL, 256LL, 257LL, 1025LL, 100000LL}) {
             // Expiration makes every payoff exactly 10. Inspect each summary
             // to verify inactive lanes are excluded from partial-block counts.

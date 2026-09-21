@@ -28,7 +28,10 @@ or minus 1.96 standard errors.
 On the GPU, each thread generates one payoff. Threads cooperate in blocks of
 256 to calculate counts, means, and squared deviations in shared memory. Only
 block summaries are written to global memory and copied to the CPU for the
-final calculation. CPU and GPU random generators differ, so the same seed does
+final calculation. GPU normal samples and payoff arithmetic use single precision;
+block statistics and the final merge use double precision. Model coefficients
+are calculated in double precision on the CPU before conversion for the kernel.
+CPU pricing uses double precision throughout. CPU and GPU random generators differ, so the same seed does
 not imply identical estimates across backends.
 
 ## Requirements
@@ -86,7 +89,11 @@ nvcc -std=c++17 -O2 -arch=sm_75 -Iinclude tests/gpu_reduction_test.cu -o build-g
 
 Tests cover partial-block counts, expiration, zero volatility, seed
 reproducibility, invalid path counts, and statistical agreement with a known
-Black–Scholes price. CUDA tests require an NVIDIA GPU.
+Black–Scholes price. A same-sample comparison against double-precision payoff
+arithmetic checks rounding error separately from random sampling variation for
+the example inputs. Deterministic prices use an absolute tolerance of 0.0001.
+These checks do not establish accuracy for every possible option parameter set.
+CUDA tests require an NVIDIA GPU.
 
 ## Benchmarks
 

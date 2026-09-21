@@ -7,6 +7,20 @@ void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+// Use identical normal samples to isolate payoff rounding from RNG differences.
+__global__ void payoffPrecisionCheck(double* errors, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    curandStatePhilox4_32_10_t state;
+    curand_init(42, i, 0, &state);
+    const float z = curand_normal(&state);
+    const float payoff = static_cast<float>(exp(-0.05)) *
+        fmaxf(100.0f * expf(0.03f + 0.2f * z) - 100.0f, 0.0f);
+    const double reference = exp(-0.05) *
+        fmax(100.0 * exp(0.03 + 0.2 * static_cast<double>(z)) - 100.0, 0.0);
+    errors[i] = static_cast<double>(payoff) - reference;
+}
+
 int main() {
     try {
         for (long long n : {2LL, 255LL, 256LL, 257LL, 1025LL, 100000LL}) {
@@ -32,7 +46,7 @@ int main() {
                 const double expected = std::max(params.spot - params.strike *
                                                  std::exp(-params.rate * params.maturity), 0.0);
                 const auto result = priceEuropeanCallGPU(params, n, 42);
-                require(std::abs(result.price - expected) < 1e-10 && result.standardError == 0,
+                require(std::abs(result.price - expected) < 1e-4 && result.standardError == 0,
                         "Deterministic pricing mismatch");
             }
         }
@@ -49,6 +63,26 @@ int main() {
             require(std::abs(result.price - 10.450583572185565) < 6 * result.standardError,
                     "Price outside six-standard-error reference bound");
         }
+        // Compare payoff arithmetic with an FP64 reference on the same samples.
+        constexpr int sampleCount = 100000;
+        DeviceBuffer<double> deviceErrors(sampleCount * sizeof(double));
+        payoffPrecisionCheck<<<(sampleCount + 255) / 256, 256>>>(deviceErrors.data, sampleCount);
+        checkCuda(cudaGetLastError(), "precision check launch");
+        checkCuda(cudaDeviceSynchronize(), "precision check execution");
+        std::vector<double> errors(sampleCount);
+        checkCuda(cudaMemcpy(errors.data(), deviceErrors.data, sampleCount * sizeof(double),
+                             cudaMemcpyDeviceToHost), "download precision errors");
+        double sumError = 0;
+        double maxError = 0;
+        for (double error : errors) {
+            require(std::isfinite(error), "Non-finite precision error");
+            sumError += error;
+            maxError = std::max(maxError, std::abs(error));
+        }
+        require(std::abs(sumError / sampleCount) < 1e-5 && maxError < 1e-3,
+                "Payoff precision error exceeds tolerance");
+        std::cout << "Mean payoff rounding error: " << sumError / sampleCount
+                  << "; max absolute error: " << maxError << '\n';
         for (long long n : {0LL, 1LL}) {
             bool rejected = false;
             try { priceEuropeanCallGPU(params, n, 42); }

@@ -58,7 +58,7 @@ __host__ __device__ Moments mergeMoments(Moments a, Moments b) {
 
 // No payoff array: samples enter the shared-memory reduction directly.
 __global__ void simulateAndReduce(
-    double spot, double strike, double drift, double diffusion, double discount,
+    float spot, float strike, float drift, float diffusion, float discount,
     unsigned long long seed, long long n, Moments* partials
 ) {
     __shared__ Moments shared[reductionThreads];
@@ -68,9 +68,11 @@ __global__ void simulateAndReduce(
     if (i < n) {
         curandStatePhilox4_32_10_t state;
         curand_init(seed, static_cast<unsigned long long>(i), 0, &state);
-        const double z = curand_normal_double(&state);
-        const double futurePrice = spot * exp(drift + diffusion * z);
-        value = {1, discount * fmax(futurePrice - strike, 0.0), 0.0};
+        const float z = curand_normal(&state);
+        const float futurePrice = spot * expf(drift + diffusion * z);
+        const float payoff = discount * fmaxf(futurePrice - strike, 0.0f);
+        // Promote before statistical accumulation; moments remain double precision.
+        value = {1, static_cast<double>(payoff), 0.0};
     }
     shared[tid] = value;
     __syncthreads();
@@ -116,11 +118,22 @@ MonteCarloResult priceEuropeanCallGPU(
     const double diffusion = params.volatility * std::sqrt(params.maturity);
     const double discount = std::exp(-params.rate * params.maturity);
 
+    const float spot = static_cast<float>(params.spot);
+    const float strike = static_cast<float>(params.strike);
+    const float driftF = static_cast<float>(drift);
+    const float diffusionF = static_cast<float>(diffusion);
+    const float discountF = static_cast<float>(discount);
+    if (!std::isfinite(spot) || spot <= 0 || !std::isfinite(strike) || strike <= 0 ||
+        !std::isfinite(driftF) || !std::isfinite(diffusionF) ||
+        !std::isfinite(discountF) || discountF <= 0) {
+        throw std::invalid_argument("Option parameters exceed GPU single-precision range");
+    }
+
     CudaEvent kernelStart;
     CudaEvent kernelEnd;
     checkCuda(cudaEventRecord(kernelStart.event), "record kernel start");
     simulateAndReduce<<<static_cast<unsigned int>(blocks), threads>>>(
-        params.spot, params.strike, drift, diffusion, discount,
+        spot, strike, driftF, diffusionF, discountF,
         seed, numSimulations, devicePartials.data);
     checkCuda(cudaGetLastError(), "simulateAndReduce launch");
     checkCuda(cudaEventRecord(kernelEnd.event), "record kernel end");
@@ -141,6 +154,9 @@ MonteCarloResult priceEuropeanCallGPU(
     }
     const double variance = total.m2 / static_cast<double>(numSimulations - 1);
     const MonteCarloResult result{total.mean, std::sqrt(variance / static_cast<double>(numSimulations))};
+    if (!std::isfinite(result.price) || !std::isfinite(result.standardError)) {
+        throw std::runtime_error("GPU payoff statistics overflowed; reduce parameter magnitudes");
+    }
     const auto aggregationEnd = std::chrono::steady_clock::now();
     if (timings) {
         *timings = {

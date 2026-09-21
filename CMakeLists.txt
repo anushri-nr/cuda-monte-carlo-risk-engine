@@ -6,17 +6,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(risk_engine src/main.cpp src/cpu_pricer.cpp src/black_scholes.cpp)
-target_include_directories(risk_engine PRIVATE include)
+add_executable(risk_benchmark src/benchmark.cpp src/cpu_pricer.cpp src/black_scholes.cpp)
+foreach(target risk_engine risk_benchmark)
+    target_include_directories(${target} PRIVATE include)
+endforeach()
 
 option(ENABLE_CUDA "Build the CUDA Monte Carlo implementation" OFF)
 if(ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-    target_sources(risk_engine PRIVATE src/gpu_pricer.cu)
-    target_link_libraries(risk_engine PRIVATE CUDA::cudart CUDA::curand)
-    target_compile_definitions(risk_engine PRIVATE RISK_ENGINE_HAS_CUDA)
-    set_target_properties(risk_engine PROPERTIES
-        CUDA_STANDARD 17
-        CUDA_STANDARD_REQUIRED ON
-    )
+    foreach(target risk_engine risk_benchmark)
+        target_sources(${target} PRIVATE src/gpu_pricer.cu)
+        target_link_libraries(${target} PRIVATE CUDA::cudart CUDA::curand)
+        target_compile_definitions(${target} PRIVATE RISK_ENGINE_HAS_CUDA)
+        set_target_properties(${target} PROPERTIES
+            CUDA_STANDARD 17
+            CUDA_STANDARD_REQUIRED ON
+        )
+    endforeach()
 endif()

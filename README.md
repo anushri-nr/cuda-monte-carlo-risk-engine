@@ -121,3 +121,42 @@ Run the reduction checks on Colab after building:
 
 These compare GPU summaries against a two-pass long-double CPU reference for
 small and partially filled blocks, constant payoffs, and large-offset data.
+
+
+## Repeated benchmarks
+
+`risk_benchmark` measures 10,000, 100,000, 1,000,000, and 10,000,000 paths.
+Each size gets one full warm-up per backend and seven measured runs in the
+same process. CPU/GPU execution order alternates. Seed 42 and the example
+option inputs stay fixed: repeated rows measure timing variability, not
+independent Monte Carlo errors. This is a serial CPU baseline.
+
+CSV rows go to stdout; medians, min/max ranges, and the ratio of CPU median to
+GPU median go to stderr. Total GPU timing includes allocation, synchronization,
+transfers, CPU summary merging, timing instrumentation, and cleanup. Warm-up
+and CSV writes are excluded. This measures repeated full calls, not persistent
+buffer reuse or kernel-only speedup. CPU-only builds also support the benchmark.
+
+On Colab, after pulling and building:
+
+```python
+!./build-gpu/risk_benchmark > benchmarks/results.csv 2> benchmarks/summary.txt
+!cat benchmarks/summary.txt
+```
+
+Check that the benchmark exits successfully before using the CSV; a failed run
+may leave partial data. Each run replaces these output files. Save environment
+information alongside results for reproducibility:
+
+```python
+!git rev-parse HEAD > benchmarks/environment.txt
+!nvidia-smi >> benchmarks/environment.txt
+!nvcc --version >> benchmarks/environment.txt
+!c++ --version >> benchmarks/environment.txt
+!lscpu >> benchmarks/environment.txt
+!cat build-gpu/CMakeCache.txt >> benchmarks/environment.txt
+```
+
+Download the results, summary, and environment files before the Colab runtime
+expires. GPU timings still require an NVIDIA environment; local CPU checks do
+not validate the CUDA benchmark path.

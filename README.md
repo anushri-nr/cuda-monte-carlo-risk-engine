@@ -92,7 +92,15 @@ standard error. CPU and GPU generators differ, so matching seeds do not imply
 matching prices. Compare each estimate with Black–Scholes using its uncertainty;
 an approximate 95% interval can miss the analytical value by chance.
 
-GPU timing includes CUDA startup, allocations, random generation, the kernel,
-device-to-host transfer, CPU aggregation, and cleanup. This initial single-run
-timing is not a warmed-up speedup benchmark. GPU reduction and repeated timing
-are later milestones.
+The program runs one full GPU warm-up call before the measured call, using the
+same seed. Warm-up samples are discarded. The measured call reports:
+
+- Kernel time using CUDA events, including cuRAND initialization and sampling.
+- Blocking device-to-host copy time using a CPU wall clock (including any host staging).
+- CPU aggregation time using a CPU wall clock.
+- Warmed end-to-end wall time, including allocations, all stages, timing
+  instrumentation, and cleanup, but excluding the warm-up and console output.
+
+The stage times do not sum to total time because setup and cleanup are additional
+costs. Each program invocation warms up its own CUDA context. This is still one
+measured run; repeated benchmarks and GPU reduction are later milestones.

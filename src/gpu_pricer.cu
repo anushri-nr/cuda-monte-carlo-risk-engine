@@ -4,6 +4,7 @@
 #include <curand_kernel.h>
 
 #include <cmath>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -27,6 +28,14 @@ struct DevicePayoffs {
     DevicePayoffs& operator=(const DevicePayoffs&) = delete;
 };
 
+struct CudaEvent {
+    cudaEvent_t event{};
+    CudaEvent() { checkCuda(cudaEventCreate(&event), "cudaEventCreate"); }
+    ~CudaEvent() { cudaEventDestroy(event); }
+    CudaEvent(const CudaEvent&) = delete;
+    CudaEvent& operator=(const CudaEvent&) = delete;
+};
+
 __global__ void simulatePayoffs(
     double spot, double strike, double drift, double diffusion, double discount,
     unsigned long long seed, long long n, double* payoffs
@@ -44,7 +53,8 @@ __global__ void simulatePayoffs(
 } // namespace
 
 MonteCarloResult priceEuropeanCallGPU(
-    const OptionParams& params, long long numSimulations, unsigned long long seed
+    const OptionParams& params, long long numSimulations, unsigned long long seed,
+    GpuTimings* timings
 ) {
     if (numSimulations < 2) {
         throw std::invalid_argument("At least two simulations are required to estimate standard error");
@@ -77,14 +87,25 @@ MonteCarloResult priceEuropeanCallGPU(
     const double diffusion = params.volatility * std::sqrt(params.maturity);
     const double discount = std::exp(-params.rate * params.maturity);
 
+    CudaEvent kernelStart;
+    CudaEvent kernelEnd;
+    checkCuda(cudaEventRecord(kernelStart.event), "record kernel start");
     simulatePayoffs<<<static_cast<unsigned int>(blocks), threads>>>(
         params.spot, params.strike, drift, diffusion, discount,
         seed, numSimulations, devicePayoffs.data);
     checkCuda(cudaGetLastError(), "simulatePayoffs launch");
-    checkCuda(cudaDeviceSynchronize(), "simulatePayoffs execution");
+    checkCuda(cudaEventRecord(kernelEnd.event), "record kernel end");
+    checkCuda(cudaEventSynchronize(kernelEnd.event), "simulatePayoffs execution");
+    float kernelMs = 0.0f;
+    checkCuda(cudaEventElapsedTime(&kernelMs, kernelStart.event, kernelEnd.event),
+              "measure kernel time");
+
+    const auto transferStart = std::chrono::steady_clock::now();
     checkCuda(cudaMemcpy(payoffs.data(), devicePayoffs.data, bytes, cudaMemcpyDeviceToHost),
               "cudaMemcpy payoffs to host");
+    const auto transferEnd = std::chrono::steady_clock::now();
 
+    const auto aggregationStart = std::chrono::steady_clock::now();
     double mean = 0.0;
     double squaredDeviationSum = 0.0;
     for (std::size_t i = 0; i < n; ++i) {
@@ -93,5 +114,14 @@ MonteCarloResult priceEuropeanCallGPU(
         squaredDeviationSum += delta * (payoffs[i] - mean);
     }
     const double variance = squaredDeviationSum / static_cast<double>(numSimulations - 1);
-    return {mean, std::sqrt(variance / static_cast<double>(numSimulations))};
+    const MonteCarloResult result{mean, std::sqrt(variance / static_cast<double>(numSimulations))};
+    const auto aggregationEnd = std::chrono::steady_clock::now();
+    if (timings) {
+        *timings = {
+            static_cast<double>(kernelMs),
+            std::chrono::duration<double, std::milli>(transferEnd - transferStart).count(),
+            std::chrono::duration<double, std::milli>(aggregationEnd - aggregationStart).count()
+        };
+    }
+    return result;
 }

@@ -37,8 +37,12 @@ int main() {
                   << "Pricing time (ms): " << elapsed.count() << '\n';
 
 #ifdef RISK_ENGINE_HAS_CUDA
+        // Run the full workload once to initialize CUDA and load the kernel.
+        // Reusing the seed keeps the reported sample unchanged.
+        priceEuropeanCallGPU(params, numSimulations, seed);
+        GpuTimings gpuTimings{};
         const auto gpuStart = std::chrono::steady_clock::now();
-        const auto gpuResult = priceEuropeanCallGPU(params, numSimulations, seed);
+        const auto gpuResult = priceEuropeanCallGPU(params, numSimulations, seed, &gpuTimings);
         const auto gpuEnd = std::chrono::steady_clock::now();
         const std::chrono::duration<double, std::milli> gpuElapsed = gpuEnd - gpuStart;
         const double gpuMargin = 1.96 * gpuResult.standardError;
@@ -51,7 +55,10 @@ int main() {
                   << "Black-Scholes price: " << analyticalPrice << '\n'
                   << "Absolute error: " << std::abs(gpuResult.price - analyticalPrice) << '\n'
                   << std::setprecision(3)
-                  << "End-to-end time (ms, includes CUDA startup): " << gpuElapsed.count() << '\n';
+                  << "Kernel time (ms, CUDA events): " << gpuTimings.kernelMs << '\n'
+                  << "Device-to-host copy time (ms, wall clock): " << gpuTimings.transferMs << '\n'
+                  << "CPU aggregation time (ms): " << gpuTimings.aggregationMs << '\n'
+                  << "Warmed end-to-end time (ms): " << gpuElapsed.count() << '\n';
 #endif
     } catch (const std::exception& error) {
         std::cerr << "Pricing failed: " << error.what() << '\n';

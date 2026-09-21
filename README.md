@@ -1,11 +1,16 @@
 # CUDA Monte Carlo Risk Engine
 
-European call option pricing in C++17 and CUDA, with analytical validation,
-statistical error estimates, and reproducible CPU/GPU benchmarks.
+I built this project to compare CPU and GPU Monte Carlo option pricing and
+measure how much GPU-side reduction changes the overall runtime. It prices
+European call options, checks the estimates against Black–Scholes, and reports
+both pricing uncertainty and execution time.
+
+The implementation uses C++17, CUDA, and cuRAND. My notes on the financial model,
+statistics, and GPU design are in [CONCEPTS.md](CONCEPTS.md).
 
 ## Implementations
 
-The project compares three ways to price the same option:
+I kept three implementations to make the comparison clear:
 
 | Implementation | Simulation | Aggregation | Data returned from GPU |
 |---|---|---|---|
@@ -13,12 +18,10 @@ The project compares three ways to price the same option:
 | `gpu_no_reduction` | GPU, one path per thread | CPU | Every discounted payoff |
 | `gpu_reduction` | GPU, one path per thread | GPU block statistics, then CPU merge | One statistical summary per block |
 
-Both GPU implementations use the same payoff-generation function, cuRAND Philox
-subsequences, seed, and arithmetic precision. Their comparison isolates the
-choice of aggregation location and the resulting allocation and transfer costs.
-The CPU uses a different random generator, so its comparison also reflects
-backend and arithmetic differences; this is not a comparison with a vectorized
-or multithreaded CPU implementation.
+Both GPU versions use the same payoff-generation function, cuRAND Philox
+subsequences, seed, and precision. I kept these consistent so their timing
+difference reflects aggregation and data movement. The CPU reference is serial
+and uses a different random generator and double-precision arithmetic.
 
 ## Pricing model
 
@@ -43,15 +46,14 @@ specified in `src/main.cpp` and `src/benchmark.cpp`. Both pricers require at lea
 two paths so sample variance is defined. The current scope is European call
 pricing.
 
-## Implementation details and rationale
+## Design choices
 
 ### CPU
 
-The CPU draws normal samples with `std::mt19937_64` and
-`std::normal_distribution<double>`. It uses double precision throughout and
-Welford's online algorithm to accumulate mean and squared deviations without
-storing every payoff. Drift and diffusion coefficients are computed once per
-call, since they are shared by all paths.
+For the CPU reference, I used `std::mt19937_64` and
+`std::normal_distribution<double>`. Welford's algorithm tracks the mean and
+variance in double precision without storing all the payoffs. Drift and
+diffusion are calculated once per call because they are the same for every path.
 
 ### GPU simulation
 
@@ -59,10 +61,10 @@ Each thread uses its path index as a Philox subsequence identifier. This makes
 sampling repeatable within the same implementation and environment and gives
 both GPU paths the same samples. CPU and GPU seeds do not imply matching samples.
 
-Normal sampling and individual payoff arithmetic use `float`; each payoff is
-promoted to `double` before statistical accumulation. This reduces expensive
-double-precision arithmetic during simulation while retaining double precision
-for variance and mean calculations. Coefficients are computed in double precision
+I use `float` for GPU normal samples and payoff calculations, then promote each
+payoff to `double` for statistical accumulation. This keeps the simulation's
+double-precision arithmetic cost down while retaining double precision for
+means and variances. Coefficients are computed in double precision
 on the host and converted for the kernel. GPU inputs outside representable
 single-precision ranges and non-finite aggregate results are rejected.
 
@@ -75,9 +77,9 @@ establish accuracy for every parameter combination.
 
 The kernel writes one promoted, double-precision discounted payoff per path.
 The entire array is copied to the CPU, which uses sequential Welford accumulation.
-This implementation demonstrates the cost of returning individual outcomes:
-its GPU output buffer, host buffer, and return transfer each contain `8 × N`
-bytes. At 10 million paths, the return transfer is 80 MB.
+I kept this version to measure the cost of copying every outcome back and
+aggregating on the CPU. Its GPU output buffer, host buffer, and return transfer
+each contain `8 × N` bytes. At 10 million paths, the return transfer is 80 MB.
 
 ### GPU with reduction
 
@@ -96,8 +98,8 @@ mean = meanA + delta × weight
 M2 = M2A + M2B + delta² × nA × weight
 ```
 
-These formulas combine variance statistics without subtracting a large squared
-mean from a sum of squares. Equal-size groups use the exact weight `0.5`, avoiding
+I use these merge formulas to avoid the numerical cancellation that can occur
+when variance is calculated by subtracting a squared mean from a mean of squares. Equal-size groups use the exact weight `0.5`, avoiding
 division in the common case. Unequal groups retain the general formula, and empty
 groups contribute nothing. Threads beyond the requested path count contribute
 empty statistics and still reach every synchronization barrier.
@@ -110,16 +112,15 @@ Final CPU work scales with the number of blocks rather than the number of paths.
 
 Every pricing call allocates, uses, and releases its own buffers and timing
 events. Resource-owning wrappers clean up when exceptions occur. CUDA launch and
-execution failures are checked before results are returned. Buffers are not
-retained between benchmark calls: total timings represent independent calls
-within an initialized process.
+execution failures are checked before results are returned. I allocate buffers within each pricing call rather than retaining them between
+calls. The benchmark therefore includes the cost of obtaining a result from an
+independent call within an initialized process.
 
 ## Build and run
 
 Requirements: CMake 3.18+ and a C++17 compiler. GPU builds additionally require a
-CUDA toolkit and compatible NVIDIA GPU. The GPU implementation has been developed
-on a Tesla T4 with CUDA 12.8; the current three-way comparison must be measured
-on the target system.
+CUDA toolkit and compatible NVIDIA GPU. I built and tested the GPU code
+on a Colab Tesla T4 with CUDA 12.8.
 
 CPU build:
 
@@ -139,9 +140,35 @@ ctest --test-dir build-gpu --output-on-failure
 ./build-gpu/risk_engine
 ```
 
-Set `CMAKE_CUDA_ARCHITECTURES` to match your GPU. In Colab, select a GPU runtime,
-use `%cd` to enter the repository, and prefix shell commands with `!`.
-The GPU executable displays results for all three implementations.
+Set `CMAKE_CUDA_ARCHITECTURES` to match the GPU. The GPU executable displays
+results for all three implementations.
+
+## Run on Google Colab
+
+Select **Runtime → Change runtime type → T4 GPU**, then run:
+
+```python
+!nvidia-smi
+!nvcc --version
+!git clone https://github.com/anushri-nr/cuda-monte-carlo-risk-engine.git
+%cd /content/cuda-monte-carlo-risk-engine
+!cmake -S . -B build-gpu -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+!cmake --build build-gpu -j2
+!ctest --test-dir build-gpu --output-on-failure
+```
+
+Once both tests pass:
+
+```python
+!./build-gpu/risk_engine
+!python3 scripts/run_benchmarks.py --build-dir build-gpu
+```
+
+Results are saved under `benchmarks/` in the folder printed by the script.
+Download the files from Colab's Files panel before disconnecting.
+
+If the repository is already cloned, use `!git pull --ff-only` from the
+repository directory instead of cloning again, then rebuild and test.
 
 ## Correctness checks
 
@@ -161,7 +188,40 @@ For the example inputs, the rounding check requires absolute mean error below
 
 ## Benchmarks and results
 
-Run tests first, then save a benchmark with environment metadata (Python 3):
+### Measured results
+
+I ran these benchmarks on Google Colab on **September 21, 2026**, at commit
+`bf9c0d2`, using a Tesla T4 and an Intel Xeon CPU @ 2.00 GHz (serial CPU pricing).
+The Release build used GCC 13.3.0, CUDA 12.8, and CUDA architecture 75.
+CPU calculations use double precision; both GPU methods use single-precision
+payoffs and double-precision statistics, as described above.
+
+Times below are **median total milliseconds [minimum–maximum]** across seven
+measured runs after one warm-up per implementation and size. They include
+allocation, transfers, aggregation, and cleanup. All three implementations
+were measured in the same benchmark run.
+
+| Paths | CPU (ms) | GPU without reduction (ms) | GPU with reduction (ms) | CPU / GPU with reduction | GPU without / with reduction |
+|---|---:|---:|---:|---:|---:|
+| 10K | 0.439 [0.431–0.553] | 1.657 [1.649–1.759] | 1.584 [1.561–1.621] | 0.28× | 1.05× |
+| 100K | 4.332 [4.320–4.588] | 2.553 [2.538–2.589] | 1.591 [1.576–1.606] | 2.72× | 1.60× |
+| 1M | 43.884 [43.656–51.268] | 11.114 [10.744–13.182] | 1.981 [1.936–2.081] | 22.16× | 5.61× |
+| 10M | 444.896 [438.863–565.078] | 134.454 [129.318–154.511] | 6.020 [5.729–6.225] | 73.91× | 22.34× |
+
+At **10 million paths**, GPU block reduction delivered **73.91× speedup over
+the serial CPU** and **22.34× over GPU without reduction**. Returning block
+statistics instead of individual payoffs reduces both transfer volume and CPU
+aggregation work. At 10K paths, CPU execution was faster than either GPU method.
+The reported speedups apply to this workload and Colab environment.
+
+Source records: [raw measurements](benchmarks/results.csv),
+[benchmark summary](benchmarks/summary.txt),
+[environment metadata](benchmarks/environment.json), and
+[build configuration](benchmarks/CMakeCache.txt).
+
+### Running the benchmark
+
+After running the tests, collect timings and environment metadata with Python 3:
 
 ```sh
 python3 scripts/run_benchmarks.py --build-dir build-gpu
@@ -200,18 +260,16 @@ transfer, aggregation, and total time use a steady host clock. With GPU reductio
 kernel time includes simulation and block aggregation. Stage times omit setup and
 cleanup and therefore need not sum to total time.
 
-GPU clocks and cloud scheduling can affect results. Compare all three methods
-within the same run, retain timing ranges, and report hardware and precision
-alongside speedups. Profiler-instrumented times are not benchmark results.
-No performance table is hard-coded here; generate the complete comparison from
-the current executable rather than combining measurements from different builds.
+GPU clocks and cloud scheduling affect timing, so I report ranges alongside
+medians and compare all three methods in the same run. Profiling is done
+separately; timings collected under Nsight are not used in the benchmark table.
 
 ## Project structure
 
 ```text
 include/       Shared option parameters and result types
 src/           CPU/GPU pricing, analytical pricing, example, and benchmark
-tests/        CPU and CUDA correctness checks
+tests/         CPU and CUDA correctness checks
 scripts/       Benchmark collection and environment capture
 benchmarks/    Saved measurements
 ```

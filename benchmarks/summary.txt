@@ -1,0 +1,30 @@
+7 measured repetitions per size; one full warm-up per backend per size.
+Fixed seed 42 measures timing variability, not independent pricing trials.
+Paths: 10000
+  cpu median 0.439 ms; range [0.431, 0.553] ms
+  gpu_no_reduction median 1.657 ms; range [1.649, 1.759] ms
+  gpu_reduction median 1.584 ms; range [1.561, 1.621] ms
+  CPU / GPU without reduction: 0.265x
+  CPU / GPU with reduction: 0.277x
+  GPU without / with reduction: 1.046x
+Paths: 100000
+  cpu median 4.332 ms; range [4.320, 4.588] ms
+  gpu_no_reduction median 2.553 ms; range [2.538, 2.589] ms
+  gpu_reduction median 1.591 ms; range [1.576, 1.606] ms
+  CPU / GPU without reduction: 1.697x
+  CPU / GPU with reduction: 2.723x
+  GPU without / with reduction: 1.605x
+Paths: 1000000
+  cpu median 43.884 ms; range [43.656, 51.268] ms
+  gpu_no_reduction median 11.114 ms; range [10.744, 13.182] ms
+  gpu_reduction median 1.981 ms; range [1.936, 2.081] ms
+  CPU / GPU without reduction: 3.948x
+  CPU / GPU with reduction: 22.156x
+  GPU without / with reduction: 5.611x
+Paths: 10000000
+  cpu median 444.896 ms; range [438.863, 565.078] ms
+  gpu_no_reduction median 134.454 ms; range [129.318, 154.511] ms
+  gpu_reduction median 6.020 ms; range [5.729, 6.225] ms
+  CPU / GPU without reduction: 3.309x
+  CPU / GPU with reduction: 73.908x
+  GPU without / with reduction: 22.336x

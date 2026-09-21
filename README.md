@@ -31,8 +31,8 @@ block summaries are written to global memory and copied to the CPU for the
 final calculation. GPU normal samples and payoff arithmetic use single precision;
 block statistics and the final merge use double precision. Model coefficients
 are calculated in double precision on the CPU before conversion for the kernel.
-CPU pricing uses double precision throughout. CPU and GPU random generators differ, so the same seed does
-not imply identical estimates across backends.
+CPU pricing uses double precision throughout. CPU and GPU random generators
+differ, so the same seed does not imply identical estimates across backends.
 
 ## Requirements
 
@@ -87,13 +87,9 @@ nvcc -std=c++17 -O2 -arch=sm_75 -Iinclude tests/gpu_reduction_test.cu -o build-g
 ./build-gpu/gpu_reduction_test
 ```
 
-Tests cover partial-block counts, expiration, zero volatility, seed
-reproducibility, invalid path counts, and statistical agreement with a known
-Black–Scholes price. A same-sample comparison against double-precision payoff
-arithmetic checks rounding error separately from random sampling variation for
-the example inputs. Deterministic prices use an absolute tolerance of 0.0001.
-These checks do not establish accuracy for every possible option parameter set.
-CUDA tests require an NVIDIA GPU.
+Tests cover partial-block counts, expiration, zero volatility, reproducibility,
+invalid path counts, analytical pricing, and payoff rounding error against a
+double-precision reference. CUDA tests require an NVIDIA GPU.
 
 ## Benchmarks
 
@@ -143,5 +139,4 @@ include/       Shared option parameters and result types
 src/           CPU/GPU pricing, Black–Scholes, example, and benchmarks
 tests/         CUDA correctness checks
 benchmarks/    Benchmark output and environment records
-scripts/       Analysis utilities
 ```

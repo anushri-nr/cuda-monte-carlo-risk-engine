@@ -63,7 +63,7 @@ int main() {
             require(std::abs(result.price - 10.450583572185565) < 6 * result.standardError,
                     "Price outside six-standard-error reference bound");
         }
-        // Compare payoff arithmetic with an FP64 reference on the same samples.
+        // Validate rounding error against double-precision payoff arithmetic.
         constexpr int sampleCount = 100000;
         DeviceBuffer<double> deviceErrors(sampleCount * sizeof(double));
         payoffPrecisionCheck<<<(sampleCount + 255) / 256, 256>>>(deviceErrors.data, sampleCount);
@@ -81,15 +81,13 @@ int main() {
         }
         require(std::abs(sumError / sampleCount) < 1e-5 && maxError < 1e-3,
                 "Payoff precision error exceeds tolerance");
-        std::cout << "Mean payoff rounding error: " << sumError / sampleCount
-                  << "; max absolute error: " << maxError << '\n';
         for (long long n : {0LL, 1LL}) {
             bool rejected = false;
             try { priceEuropeanCallGPU(params, n, 42); }
             catch (const std::invalid_argument&) { rejected = true; }
             require(rejected, "Invalid simulation count accepted");
         }
-        std::cout << "GPU checks passed (block counts, deterministic prices, reproducibility, analytical reference).\n";
+        std::cout << "GPU checks passed (block counts, deterministic prices, reproducibility, analytical reference, payoff precision).\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

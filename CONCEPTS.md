@@ -26,8 +26,7 @@ profit: profit would account for the premium paid and any other costs.
 The engine estimates what that uncertain future payoff is worth **today**.
 Theoretical option valuation uses inputs such as stock price, strike, interest
 rate, volatility, and time to expiration. A model price is not a guarantee of
-an available market price. See the Options Industry Council's
-[Black–Scholes overview](https://prd-web.optionseducation.org/advancedconcepts/black-scholes-formula).
+an available market price. 
 
 ### Inputs and units
 
